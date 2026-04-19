@@ -1,0 +1,141 @@
+run:
+  name: "qwen3-8b-dcops-sft-v1"
+  output_dir: "./outputs/qwen3-8b-dcops-sft-v1"
+  seed: 3407
+  wandb_project: "dc-ops-sft"
+  wandb_entity: null
+  report_to: "wandb"      
+
+# -----------------------------------------------------------------------------
+# Model — Qwen3-8B in bf16 with 16-bit LoRA.
+# -----------------------------------------------------------------------------
+#   • Not 4-bit: user has 192 GB HBM, and Unsloth docs warn QLoRA is lossy on
+#     Qwen3.x. bf16 LoRA ≈ 16 GB weights + ~50 GB activations + LoRA/optim
+#     ≈ 70-90 GB peak — fits comfortably, leaves ~100 GB for vLLM
+#     fast_inference during GRPO on the same box (should the user ever want).
+#   • unsloth/ prefix uses Unsloth's pre-converted repo (same weights, faster
+#     download via hf_transfer, includes the Dynamic-2.0 tokenizer patches).
+# -----------------------------------------------------------------------------
+model:
+  name: "unsloth/Qwen3-8B"
+  max_seq_length: 8192          
+  dtype: "bfloat16"             
+  load_in_4bit: false
+  load_in_16bit: true           
+  full_finetuning: false
+  thinking_mode: true
+
+# -----------------------------------------------------------------------------
+# LoRA — standard all-linear targets at rank 32.
+# -----------------------------------------------------------------------------
+#   • r=32, alpha=32 → scale=1.0. Higher than Unsloth's default r=16 because
+#     we have VRAM to spare and a nontrivial domain shift (DC-Ops reasoning).
+#   • "unsloth" gradient checkpointing: ~30% less VRAM, lets us push batch up.
+#   • rslora/loftq off (Unsloth-recommended).
+# -----------------------------------------------------------------------------
+lora:
+  r: 32
+  alpha: 32
+  dropout: 0.0
+  bias: "none"
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  gradient_checkpointing: false # No need to save vram. Speeds up the training loop.
+  use_rslora: false
+
+# -----------------------------------------------------------------------------
+# Data — Melikshah/dc-ops-sft-data, fanned out per-turn, prompt-completion.
+# -----------------------------------------------------------------------------
+#   • fan_out=true: every gpt turn becomes a prompt-completion pair. 1083
+#     episodes → 8387 training examples. Each example's completion (the
+#     current agent turn) retains <think>; the prompt (history) has prior
+#     <think> stripped by Qwen3's template, matching inference distribution
+#     exactly.
+#   • If fan_out=false, each episode is a single example (uses assistant_only_loss).
+#   • Filter: skip examples that exceed max_seq_length AFTER tokenization.
+# -----------------------------------------------------------------------------
+data:
+  hf_dataset: "Melikshah/dc-ops-sft-data"
+  hf_dataset_split: "train"
+  # If null, uses the HF hub dataset. If set, loads a local JSONL.
+  local_jsonl: null
+  fan_out: true
+  eval_size: 100                # holdout for loss eval (not env eval)
+  num_proc: 8                   # dataset.map parallelism
+  min_completion_chars: 50      # filter out bad/empty completions
+  shuffle_seed: 3407
+
+# -----------------------------------------------------------------------------
+# Training — targets ~2h wall-clock on 1x MI300X.
+# -----------------------------------------------------------------------------
+#   • bs=4 × grad_accum=4 → effective 16. On packed sequences of 8192 tokens,
+#     that's ~500k training tokens per optimizer step. 8387 examples (~22M
+#     supervised tokens) → ~45 steps/epoch, 2 epochs → ~90 steps.
+#     Plenty of warmup headroom.
+#   • packing=True: Unsloth's padding-free packing, 2-5x throughput vs pad-to-max.
+#   • completion_only_loss=true: loss only on the agent's target turn, not the
+#     dashboard prompt. This is the default for prompt-completion data in TRL.
+#   • lr=2e-4 for LoRA (higher than full FT).
+#   • cosine scheduler with 3% warmup.
+#   • adamw_8bit: LoRA-only so this uses ~50 MB of optim state.
+# -----------------------------------------------------------------------------
+training:
+  num_train_epochs: 2
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-4
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  optim: "adamw_8bit"
+  bf16: true
+  fp16: false
+  packing: true
+  completion_only_loss: true
+  logging_steps: 1
+  save_steps: 100
+  save_total_limit: 3
+  eval_strategy: "steps"
+  eval_steps: 50
+  # Saves to output_dir/final_lora and output_dir/final_merged_16bit.
+  save_merged_16bit: true
+  save_lora_only: true
+  # DataLoader
+  dataloader_num_workers: 4
+  dataloader_pin_memory: true
+  # Reproducibility
+  group_by_length: false        # disabled; breaks packing
+  remove_unused_columns: false
+
+# -----------------------------------------------------------------------------
+# Inference eval (scripts/eval_compare.py) — after SFT, roll out N episodes
+# against the live DcOpsEnvironment with base model vs SFT model.
+# -----------------------------------------------------------------------------
+eval:
+  scenarios: ["A1", "A2", "A4", "B1", "B3", "B4"]
+  episodes_per_scenario: 3
+  max_new_tokens: 1024          # enough for a single <think>+<reasoning>+<command>
+  temperature: 0.6              # Qwen3 thinking-mode default
+  top_p: 0.95
+  top_k: 20
+  # Number of prior turns to keep in the rolling context. Older turns dropped
+  # FIFO once exceeded to avoid context bloat.
+  history_window: 16
+
+# -----------------------------------------------------------------------------
+# HF Hub push — scripts/push_to_hub.py
+# -----------------------------------------------------------------------------
+hub:
+  repo_id: "Melikshah/qwen3-8b-dcops-sft"
+  private: false
+  push_merged: true
+  push_lora: true
+  commit_message: "SFT checkpoint — Qwen3-8B on DC-Ops (bf16 LoRA r=32, 2 epochs)"

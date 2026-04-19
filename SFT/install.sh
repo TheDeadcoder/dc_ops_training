@@ -1,38 +1,58 @@
 #!/usr/bin/env bash
 # =============================================================================
-# install.sh — ROCm 7.2 / MI300X bootstrap for Unsloth SFT + vLLM GRPO
+# install.sh — ROCm 7.2 / MI300X bootstrap (FIXED)
 # =============================================================================
-# Tested stack (verified Jan 2026):
-#   • ROCm 7.2.x runtime on host
-#   • PyTorch 2.9.x (ROCm 7.1 stable wheels) or 2.10 nightly (ROCm 7.2)
-#   • Unsloth AMD branch   (supports MI300X / gfx942)
-#   • TRL 0.22.2, transformers 4.57.1  (Qwen3 + assistant mask verified)
-#   • vLLM ROCm wheels     (needed later for GRPO fast_inference)
-#   • bitsandbytes 0.45+   (multi-backend, ROCm supported)
-#
-# Usage:
-#   chmod +x install.sh
-#   ./install.sh            
+# Stack (verified against PyTorch + Unsloth current pyproject.toml, Apr 2026):
+#   • torch 2.10.0         from https://download.pytorch.org/whl/rocm7.1
+#                          (PyTorch's rocm7.1 index is the newest stable index;
+#                           wheels there are ABI-compatible with ROCm 7.2 runtime)
+#   • transformers 4.57.1  (inside Unsloth's allowed range)
+#   • trl 0.22.2           (assistant-mask Qwen3 auto-patch works here)
+#   • peft >= 0.18.0       (Unsloth main currently requires this)
+#   • datasets >= 3.4.1, <4.4.0
+#   • unsloth + unsloth_zoo AMD path (installed --no-deps to keep our torch)
+#   • vLLM ROCm (optional; only needed later for GRPO)
+#   • NO xformers — on ROCm, Unsloth falls back to SDPA (AOTriton on MI300X).
+#   • NO bitsandbytes — we default to adamw_torch_fused (ROCm bnb has NaN risk).
 # =============================================================================
 set -euo pipefail
 
-log() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
-die() { printf '\n\033[1;31mERR:\033[0m %s\n' "$*" >&2; exit 1; }
+log()  { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
+warn() { printf '\n\033[1;33m!!\033[0m %s\n' "$*"; }
+die()  { printf '\n\033[1;31mERR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # -----------------------------------------------------------------------------
 # 0. Sanity checks
 # -----------------------------------------------------------------------------
+command -v uv >/dev/null 2>&1 || die "uv not found. Install: curl -LsSf https://astral.sh/uv/install.sh | sh"
 command -v python3 >/dev/null 2>&1 || die "python3 not found."
 
-# Detect ROCm version. MI300X is gfx942, ROCm 7.x.
-ROCM_VER="unknown"
-if command -v amd-smi >/dev/null 2>&1; then
-    ROCM_VER=$(amd-smi version 2>/dev/null | awk -F'ROCm version: ' 'NF>1 {split($2,a," "); print a[1]; exit}' || true)
-fi
-if [[ "$ROCM_VER" == "unknown" ]] && [[ -r /opt/rocm/.info/version ]]; then
-    ROCM_VER=$(cat /opt/rocm/.info/version 2>/dev/null || true)
-fi
-log "Detected ROCm: $ROCM_VER (expected 7.2.x)"
+# -----------------------------------------------------------------------------
+# 0.1 ROCm detection (INFORMATIONAL ONLY — install uses a fixed wheel index)
+# -----------------------------------------------------------------------------
+detect_rocm() {
+    local v=""
+    # amd-smi table format ("ROCm version: 7.2.0")
+    if command -v amd-smi >/dev/null 2>&1; then
+        v=$(amd-smi 2>/dev/null | awk -F'ROCm version: ' 'NF>1 {split($2,a,"[ |]"); print a[1]; exit}' || true)
+        [[ -n "$v" ]] && { echo "$v (amd-smi)"; return; }
+        v=$(amd-smi version 2>/dev/null | awk -F'ROCm version: ' 'NF>1 {split($2,a,"[ |]"); print a[1]; exit}' || true)
+        [[ -n "$v" ]] && { echo "$v (amd-smi version)"; return; }
+    fi
+    # /opt/rocm/.info/version (may lag the kernel driver in a container)
+    if [[ -r /opt/rocm/.info/version ]]; then
+        v=$(cat /opt/rocm/.info/version 2>/dev/null | head -1 | tr -d ' ')
+        [[ -n "$v" ]] && { echo "$v (/opt/rocm/.info/version)"; return; }
+    fi
+    if command -v hipconfig >/dev/null 2>&1; then
+        v=$(hipconfig --version 2>/dev/null || true)
+        [[ -n "$v" ]] && { echo "$v (hipconfig)"; return; }
+    fi
+    echo "unknown"
+}
+ROCM_INFO=$(detect_rocm)
+log "Detected ROCm: $ROCM_INFO"
+log "(We install torch 2.10.0 from rocm7.1 index — ABI-compatible with ROCm 7.0-7.2)"
 
 # -----------------------------------------------------------------------------
 # 1. Virtualenv
@@ -44,39 +64,38 @@ fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
-# hf_transfer for fast HF downloads
 export HF_HUB_ENABLE_HF_TRANSFER=1
-# Prevent a non-RoCm torch from sneaking in
 export PIP_EXTRA_INDEX_URL=""
 
 # -----------------------------------------------------------------------------
-# 2. PyTorch + triton for ROCm
+# 2. PyTorch for ROCm
 # -----------------------------------------------------------------------------
-# We use ROCm 7.1 stable wheels (torch 2.9.x) — these are the ABI that
-# vLLM ROCm wheels target, and Unsloth's AMD branch has been validated
-# against them. They also work on ROCm 7.2 runtime (minor rev, same ABI).
-#
-# If you want bleeding edge, swap to nightly rocm7.2:
-#   --index-url https://download.pytorch.org/whl/nightly/rocm7.2
-log "Installing PyTorch (ROCm 7.1 stable, torch 2.9.1)"
+# torch 2.10.0 is what's actually on pytorch.org's rocm7.1 index (2.9.1 isn't).
+# Works fine on ROCm 7.2 runtime — minor ROCm revs are ABI-stable.
+log "Installing torch==2.10.0 (ROCm 7.1 wheels, works on ROCm 7.2 runtime)"
 uv pip install --upgrade --force-reinstall \
-    torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
-    --index-url https://download.pytorch.org/whl/rocm7.1
+    "torch==2.10.0" "torchvision==0.25.0" "torchaudio==2.10.0" \
+    --index-url https://download.pytorch.org/whl/rocm7.1 \
+    || die "torch install failed. See NOTES at bottom for AMD wheel fallback."
 
-python -c "import torch; print(f'torch {torch.__version__}, cuda_available={torch.cuda.is_available()}, hip={torch.version.hip}')" \
-    || die "torch import failed"
+python -c "
+import torch
+print(f'torch = {torch.__version__}')
+print(f'cuda.is_available = {torch.cuda.is_available()}')
+print(f'hip = {torch.version.hip}')
+" || die "torch imported but something is off."
 
 # -----------------------------------------------------------------------------
-# 3. Core training deps (pinned)
+# 3. Core HF training deps (pinned inside Unsloth's supported ranges)
 # -----------------------------------------------------------------------------
-log "Installing training deps (transformers, trl, peft, accelerate, datasets, wandb, ...)"
+log "Installing transformers, trl, peft, accelerate, datasets, wandb, ..."
 uv pip install \
     "transformers==4.57.1" \
     "trl==0.22.2" \
-    "peft>=0.13.0" \
+    "peft>=0.18.0" \
     "accelerate>=1.0.0" \
-    "datasets>=3.0.0,<5.0.0" \
-    "huggingface_hub>=0.26.0" \
+    "datasets>=3.4.1,<4.4.0" \
+    "huggingface_hub>=0.34.0" \
     "safetensors>=0.4.5" \
     "sentencepiece>=0.2.0" \
     "protobuf>=4.25.0" \
@@ -89,75 +108,66 @@ uv pip install \
     "rich>=13.7.0" \
     "pydantic>=2.0.0" \
     "orjson>=3.10.0" \
-    "xformers==0.0.33.post1" \
+    "typer" \
+    "nest-asyncio" \
+    "diffusers" \
     "cut_cross_entropy" \
-    || die "Core deps install failed"
-
-# bitsandbytes multi-backend (includes ROCm). Needed by adamw_8bit optimizer.
-# If this wheel install fails on your ROCm version, fall back to:
-#   git clone -b rocm_enabled_multi_backend https://github.com/ROCm/bitsandbytes
-#   cd bitsandbytes && pip install -r requirements-dev.txt && \
-#       cmake -DCOMPUTE_BACKEND=hip -S . && make -j && pip install .
-log "Installing bitsandbytes (multi-backend)"
-uv pip install "bitsandbytes>=0.45.0" || log "bitsandbytes install warning — continuing"
+    || die "HF deps install failed."
 
 # -----------------------------------------------------------------------------
-# 4. Unsloth (AMD branch)
+# 4. Unsloth (install --no-deps to preserve our torch)
 # -----------------------------------------------------------------------------
-# Official path per https://unsloth.ai/docs/get-started/install/amd
-# We install with --no-deps on the first step to prevent unsloth-zoo
-# from dragging a CUDA torch wheel in.
-log "Installing Unsloth (AMD / MI300X)"
-uv pip install --no-deps "unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo.git"
-uv pip install --no-deps "unsloth[amd] @ git+https://github.com/unslothai/unsloth"
+# Note: we do NOT use `unsloth[amd]` because that extra pulls in its own torch
+# from repo.radeon.com. We already have torch from pytorch.org and it works.
+# At import time, Unsloth detects our ROCm platform and uses SDPA (no xformers
+# needed on MI300X — AOTriton provides the fast-attention path).
+log "Installing Unsloth from git (--no-deps)"
+uv pip install --no-deps "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo.git"
+uv pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth"
 
-python -c "import unsloth; print(f'unsloth {unsloth.__version__}')" \
-    || die "unsloth import failed"
-
-# -----------------------------------------------------------------------------
-# 5. vLLM ROCm (only needed for GRPO later; safe to install now)
-# -----------------------------------------------------------------------------
-# Pre-built ROCm wheels live at https://wheels.vllm.ai/rocm/. These bundle
-# a matched torch — we install with --no-deps to preserve our torch.
-# If you are ONLY doing SFT on this box, you can comment this out to save
-# ~2 GB of install.
-log "Installing vLLM (ROCm wheels, no-deps)"
-uv pip install --no-deps "vllm" --extra-index-url https://wheels.vllm.ai/rocm/ \
-    || log "vLLM install skipped (OK for SFT-only box)"
+python -c "import unsloth_zoo; print(f'unsloth_zoo = {unsloth_zoo.__version__}')"
+python -c "import unsloth;     print(f'unsloth      = {unsloth.__version__}')"
 
 # -----------------------------------------------------------------------------
-# 6. Install this project (for imports)
+# 5. vLLM ROCm (OPTIONAL — only for later GRPO, not for SFT)
 # -----------------------------------------------------------------------------
-log "Installing dc-ops-sft (editable)"
+log "Installing vLLM (ROCm wheels, --no-deps). Non-fatal if it fails."
+if uv pip install --no-deps "vllm" \
+       --extra-index-url https://wheels.vllm.ai/rocm/ 2>&1 | tail -5; then
+    log "vLLM installed."
+else
+    warn "vLLM install failed — OK for an SFT-only box. Install on the GRPO machine."
+fi
+
+# -----------------------------------------------------------------------------
+# 6. This project (editable)
+# -----------------------------------------------------------------------------
+log "Installing dc-ops-sft (editable, --no-deps)"
 uv pip install -e . --no-deps
 
 # -----------------------------------------------------------------------------
-# 7. (Optional) dc_ops_env — for env_eval / eval_compare.py
+# 7. OPTIONAL: dc_ops_env for eval_compare.py
 # -----------------------------------------------------------------------------
-# Needed only if you want to run `scripts/eval_compare.py` locally.
-# Pass the path to your dc_ops_environment checkout as arg $1, or set
-# DC_OPS_ENV_PATH env var, else we skip.
 DC_OPS_ENV_PATH="${DC_OPS_ENV_PATH:-${1:-}}"
 if [[ -n "$DC_OPS_ENV_PATH" ]] && [[ -d "$DC_OPS_ENV_PATH" ]]; then
     log "Installing dc_ops_env from $DC_OPS_ENV_PATH"
     uv pip install -e "$DC_OPS_ENV_PATH" --no-deps
     uv pip install "openenv-core[core]>=0.2.1" "fastapi>=0.115.0" "uvicorn>=0.24.0"
 else
-    log "DC_OPS_ENV_PATH not set — skipping env install. Set it if you want eval_compare."
+    warn "DC_OPS_ENV_PATH not set — skipping env install."
+    warn "(Only needed for scripts/eval_compare.py. Pass the path as the first arg.)"
 fi
 
 # -----------------------------------------------------------------------------
-# 8. Final verification
+# 8. Verification
 # -----------------------------------------------------------------------------
-log "Verification:"
+log "Final verification:"
 python - <<'PY'
-import torch, transformers, trl, peft, datasets
-import unsloth
+import torch, transformers, trl, peft, datasets, unsloth, unsloth_zoo
 print(f"  torch          : {torch.__version__}  (hip={torch.version.hip})")
 print(f"  cuda_available : {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"  device_name    : {torch.cuda.get_device_name(0)}")
-    print(f"  device_count   : {torch.cuda.device_count()}")
     free, total = torch.cuda.mem_get_info(0)
     print(f"  vram           : {free/2**30:.1f} / {total/2**30:.1f} GB free")
 print(f"  transformers   : {transformers.__version__}")
@@ -165,16 +175,30 @@ print(f"  trl            : {trl.__version__}")
 print(f"  peft           : {peft.__version__}")
 print(f"  datasets       : {datasets.__version__}")
 print(f"  unsloth        : {unsloth.__version__}")
+print(f"  unsloth_zoo    : {unsloth_zoo.__version__}")
 try:
     import vllm
     print(f"  vllm           : {vllm.__version__}")
 except Exception as e:
-    print(f"  vllm           : NOT INSTALLED ({e})")
-try:
-    import bitsandbytes as bnb
-    print(f"  bitsandbytes   : {bnb.__version__}")
-except Exception as e:
-    print(f"  bitsandbytes   : {e}")
+    print(f"  vllm           : not installed ({type(e).__name__})")
 PY
 
 log "Install complete. Activate with: source .venv/bin/activate"
+log "Next step: python -m dc_ops_sft.data unsloth/Qwen3-8B  (smoke check)"
+
+# =============================================================================
+# NOTES — fallback if step 2 (torch 2.10 / rocm7.1) fails on your box:
+# =============================================================================
+# Option A — AMD's manylinux wheels (exact-match ROCm 7.2.1):
+#   BASE=https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1
+#   uv pip install --force-reinstall \
+#       $BASE/torch-2.9.1+rocm7.2.1.lw.gitff65f5bc-cp312-cp312-linux_x86_64.whl \
+#       $BASE/torchvision-0.24.0+rocm7.2.1.gitb919bd0c-cp312-cp312-linux_x86_64.whl \
+#       $BASE/torchaudio-2.9.0+rocm7.2.1.gite3c6ee2b-cp312-cp312-linux_x86_64.whl \
+#       $BASE/triton-3.5.1+rocm7.2.1.gita272dfa8-cp312-cp312-linux_x86_64.whl
+#   uv pip install 'numpy<2.0'   # required with these wheels
+#
+# Option B — pytorch nightly rocm7.2:
+#   uv pip install --pre torch torchvision torchaudio \
+#       --index-url https://download.pytorch.org/whl/nightly/rocm7.2
+# =============================================================================

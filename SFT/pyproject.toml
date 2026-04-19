@@ -9,18 +9,17 @@ description = "SFT pipeline for DC-Ops OpenEnv agent — Qwen3-8B on MI300X / RO
 requires-python = ">=3.10,<3.13"
 authors = [{ name = "Melikshah" }]
 
-# NOTE: torch, unsloth, vllm are NOT listed here. They are installed by
-# `install.sh` because they require ROCm-specific wheels that cannot be
-# resolved by a generic PyPI resolver. pyproject.toml lists only the deps
-# that are ROCm-agnostic and safe for uv to resolve without pulling CUDA
-# versions of torch.
+# NOTE: torch, unsloth, unsloth_zoo, vllm are NOT listed here — they are
+# installed by `install.sh` with ROCm-specific wheels that a generic PyPI
+# resolver cannot find. This section is the ROCm-agnostic tail.
+# Version floors track Unsloth's current pyproject.toml (main @ Apr 2026).
 dependencies = [
     "transformers==4.57.1",
     "trl==0.22.2",
-    "peft>=0.13.0",
+    "peft>=0.18.0",
     "accelerate>=1.0.0",
-    "datasets>=3.0.0,<5.0.0",
-    "huggingface_hub>=0.26.0",
+    "datasets>=3.4.1,<4.4.0",
+    "huggingface_hub>=0.34.0",
     "safetensors>=0.4.5",
     "sentencepiece>=0.2.0",
     "protobuf>=4.25.0",
@@ -37,7 +36,6 @@ dependencies = [
 
 [project.optional-dependencies]
 env = [
-    # Needed only for eval_compare.py — the local DcOpsEnvironment import
     "openenv-core[core]>=0.2.1",
     "fastapi>=0.115.0",
     "uvicorn>=0.24.0",

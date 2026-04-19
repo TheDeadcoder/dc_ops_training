@@ -198,7 +198,10 @@ def rollout_episode(
 
     t0 = time.time()
     obs = env.reset(scenario=scenario_id)
-    episode_id = env.state.episode_id
+    # DcOpsEnvironment stores this as env._state.episode_id (protected attr).
+    # Fall back to a generated id so we never crash on attribute lookup.
+    episode_id = getattr(getattr(env, "_state", None), "episode_id", None) \
+                 or f"{scenario_id}-{int(time.time()*1000)}"
 
     budget = max_steps if max_steps is not None else obs.steps_remaining
     if budget <= 0:

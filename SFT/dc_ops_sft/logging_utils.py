@@ -143,7 +143,8 @@ def configure_wandb_env(run_name: str, project: str, entity: Optional[str]) -> N
     os.environ["WANDB_PROJECT"] = project
     if entity:
         os.environ["WANDB_ENTITY"] = entity
-    os.environ["WANDB_RUN_NAME"] = run_name
+    # WANDB_NAME is the canonical env var; HF Trainer also reads it.
+    os.environ["WANDB_NAME"] = run_name
     # Tell wandb to log the full config (otherwise it only logs TrainingArguments)
     os.environ.setdefault("WANDB_LOG_MODEL", "false")
     os.environ.setdefault("WANDB_WATCH", "false")

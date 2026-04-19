@@ -2,32 +2,35 @@
 """
 Dataset preparation for DC-Ops SFT.
 
-The HF dataset `Melikshah/dc-ops-sft-data` has one row per episode with a
-`conversations` list in ShareGPT format:
+The HF dataset `Melikshah/dc-ops-sft-data` has TWO JSONL files at the top level:
+  - train.jsonl           (63.6 MB — canonical training file, 1083 episodes)
+  - train_with_meta.jsonl (64.3 MB — same data + per-episode metadata columns)
 
-    [
+We explicitly pin to `train.jsonl` so HF datasets doesn't concatenate them.
+
+Each row is ShareGPT-format:
+
+    {"conversations": [
         {"from": "system", "value": "You are DC-Ops Agent..."},
         {"from": "human",  "value": "<dashboard>"},
         {"from": "gpt",    "value": "<think>...</think>\n<reasoning>...</reasoning>\n<command>...</command>"},
         {"from": "human",  "value": "<next dashboard>"},
         {"from": "gpt",    "value": "..."},
         ...
-    ]
+    ]}
 
-This module:
+Pipeline:
+  1. ShareGPT keys → OpenAI keys (role/content)
+  2. Fan out each episode into N prompt-completion pairs (one per agent turn).
+     For turn t: prompt = messages[:t], completion = [messages[t]].
+     Qwen3's chat template strips <think> from non-final assistant messages
+     automatically — so history in the prompt has no think blocks (matches
+     inference distribution), while the completion keeps its think (the target).
+  3. Filter out examples exceeding max_seq_length after tokenization.
 
-  1. Converts ShareGPT keys -> OpenAI keys (role/content)
-  2. Fans out each episode into N prompt-completion pairs, one per agent turn.
-     For turn t, the prompt is all messages before turn t; the completion is
-     the gpt message at turn t. Qwen3's chat template strips `<think>` from
-     any *non-final* assistant message automatically, so the prompt's history
-     has no think blocks (matches inference distribution), while the
-     completion keeps its think block (the training target).
-  3. Filters out examples longer than max_seq_length after tokenization, and
-     examples with suspiciously short completions.
-
-This format is directly consumable by TRL's SFTTrainer with
-completion_only_loss=True and packing=True.
+Output shape:
+  { "prompt": [...], "completion": [...] }
+  directly consumable by TRL SFTTrainer with completion_only_loss=True + packing=True.
 """
 
 from __future__ import annotations
@@ -37,7 +40,8 @@ from typing import Any, Dict, List, Tuple
 from datasets import Dataset, load_dataset
 from transformers import PreTrainedTokenizerBase
 
-# ShareGPT -> OpenAI role mapping
+
+# ShareGPT → OpenAI role mapping
 ROLE_MAP = {"system": "system", "human": "user", "gpt": "assistant"}
 
 
@@ -57,19 +61,13 @@ def _conversations_to_messages(
 def _fan_out_messages(
     messages: List[Dict[str, str]],
 ) -> List[Tuple[List[Dict[str, str]], List[Dict[str, str]]]]:
-    """Return one (prompt, completion) pair per assistant turn.
-
-    For assistant turn i:
-      prompt = messages[:i]     (ends in a user turn)
-      completion = [messages[i]]
-    """
+    """Return one (prompt, completion) pair per assistant turn."""
     pairs: List[Tuple[List[Dict[str, str]], List[Dict[str, str]]]] = []
     for i, msg in enumerate(messages):
         if msg["role"] != "assistant":
             continue
         if i == 0:
-            # Degenerate: assistant as first message -> no context to learn from.
-            continue
+            continue  # Degenerate: assistant as first message → no context.
         pairs.append((messages[:i], [msg]))
     return pairs
 
@@ -156,7 +154,6 @@ def filter_dataset(
             full_messages = example["prompt"] + completion
         else:
             full_messages = example["messages"]
-            # at least one assistant with non-trivial content
             has_good_assistant = any(
                 m.get("role") == "assistant"
                 and len(m.get("content", "")) >= min_completion_chars
@@ -169,6 +166,31 @@ def filter_dataset(
         return 0 < length <= max_seq_length
 
     return ds.filter(_keep, num_proc=num_proc, desc="Filtering by length")
+
+
+def _load_raw(
+    hf_dataset: str | None,
+    local_jsonl: str | None,
+    hf_dataset_split: str = "train",
+    hf_dataset_file: str = "train.jsonl",
+) -> Dataset:
+    """Load the raw dataset, explicitly pinning to one JSONL file on the hub.
+
+    The HF dataset has both `train.jsonl` and `train_with_meta.jsonl`; without
+    `data_files` HF would auto-concatenate them, doubling the dataset.
+    """
+    if local_jsonl:
+        print(f"[data] loading local: {local_jsonl}")
+        return load_dataset("json", data_files=local_jsonl, split="train")
+
+    assert hf_dataset is not None, "Must provide hf_dataset or local_jsonl"
+    print(f"[data] loading hub: {hf_dataset}  (file={hf_dataset_file!r})")
+    # Explicit data_files={"train": "train.jsonl"} pins to the one file we want.
+    return load_dataset(
+        hf_dataset,
+        data_files={hf_dataset_split: hf_dataset_file},
+        split=hf_dataset_split,
+    )
 
 
 def prepare_dataset(
@@ -184,23 +206,15 @@ def prepare_dataset(
     min_completion_chars: int = 50,
     chat_template_kwargs: Dict[str, Any] | None = None,
     hf_dataset_split: str = "train",
-    hf_data_files: str | List[str] | None = "train.jsonl",
+    hf_dataset_file: str = "train.jsonl",
 ) -> Tuple[Dataset, Dataset | None]:
     """Top-level dataset preparation.
 
-    Returns (train_ds, eval_ds) where eval_ds may be None if eval_size<=0.
+    Returns (train_ds, eval_ds); eval_ds is None if eval_size<=0.
     """
-    # 1. Load raw
-    if local_jsonl:
-        raw = load_dataset("json", data_files=local_jsonl, split="train")
-    else:
-        assert hf_dataset is not None, "Must provide hf_dataset or local_jsonl"
-        raw = load_dataset(hf_dataset, data_files=hf_data_files, split=hf_dataset_split)
+    raw = _load_raw(hf_dataset, local_jsonl, hf_dataset_split, hf_dataset_file)
+    print(f"[data] loaded {len(raw):,} raw episodes")
 
-    print(f"[data] loaded {len(raw):,} raw episodes from "
-          f"{hf_dataset or local_jsonl}")
-
-    # 2. Reshape
     if fan_out:
         ds = fan_out_dataset(raw, num_proc=num_proc)
         print(f"[data] after fan-out: {len(ds):,} examples")
@@ -208,7 +222,6 @@ def prepare_dataset(
         ds = _to_messages_format(raw, num_proc=num_proc)
         print(f"[data] non-fan-out: {len(ds):,} multi-turn episodes")
 
-    # 3. Filter
     before = len(ds)
     ds = filter_dataset(
         ds,
@@ -223,7 +236,6 @@ def prepare_dataset(
     print(f"[data] after filter (<= {max_seq_length:,} tok): "
           f"{len(ds):,} / {before:,} (dropped {dropped:,}, {pct:.1f}%)")
 
-    # 4. Shuffle + split
     ds = ds.shuffle(seed=shuffle_seed)
     if eval_size > 0 and len(ds) > eval_size * 4:
         split = ds.train_test_split(test_size=eval_size, seed=shuffle_seed)
@@ -233,7 +245,8 @@ def prepare_dataset(
 
 
 # -----------------------------------------------------------------------------
-# Quick sanity checks (run: python -m dc_ops_sft.data)
+# Standalone smoke check:
+#   python -m dc_ops_sft.data unsloth/Qwen3-8B
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
@@ -250,7 +263,11 @@ if __name__ == "__main__":
         eval_size=50,
         chat_template_kwargs={"enable_thinking": True},
     )
-    print("\nExample 0 prompt (last msg):")
+    print("\n== Example 0 ==")
+    print("prompt (last msg, first 500 chars):")
     print(train_ds[0]["prompt"][-1]["content"][:500], "...")
-    print("\nExample 0 completion:")
+    print("\ncompletion (first 500 chars):")
     print(train_ds[0]["completion"][0]["content"][:500], "...")
+    print(f"\ntrain size: {len(train_ds):,}")
+    if eval_ds:
+        print(f"eval size:  {len(eval_ds):,}")

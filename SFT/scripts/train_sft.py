@@ -149,6 +149,7 @@ def main() -> int:
         min_completion_chars=cfg.data.min_completion_chars,
         chat_template_kwargs=tpl_kwargs,
         hf_dataset_split=cfg.data.hf_dataset_split,
+        hf_dataset_file=cfg.data.get("hf_dataset_file", "train.jsonl"),
     )
 
     # ---- trainer ----

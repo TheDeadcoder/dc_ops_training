@@ -184,6 +184,7 @@ def prepare_dataset(
     min_completion_chars: int = 50,
     chat_template_kwargs: Dict[str, Any] | None = None,
     hf_dataset_split: str = "train",
+    hf_data_files: str | List[str] | None = "train.jsonl",
 ) -> Tuple[Dataset, Dataset | None]:
     """Top-level dataset preparation.
 
@@ -194,7 +195,7 @@ def prepare_dataset(
         raw = load_dataset("json", data_files=local_jsonl, split="train")
     else:
         assert hf_dataset is not None, "Must provide hf_dataset or local_jsonl"
-        raw = load_dataset(hf_dataset, split=hf_dataset_split)
+        raw = load_dataset(hf_dataset, data_files=hf_data_files, split=hf_dataset_split)
 
     print(f"[data] loaded {len(raw):,} raw episodes from "
           f"{hf_dataset or local_jsonl}")

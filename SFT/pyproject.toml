@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dc-ops-sft"
+version = "0.1.0"
+description = "SFT pipeline for DC-Ops OpenEnv agent — Qwen3-8B on MI300X / ROCm 7.2"
+requires-python = ">=3.10,<3.13"
+authors = [{ name = "Melikshah" }]
+
+# NOTE: torch, unsloth, vllm are NOT listed here. They are installed by
+# `install.sh` because they require ROCm-specific wheels that cannot be
+# resolved by a generic PyPI resolver. pyproject.toml lists only the deps
+# that are ROCm-agnostic and safe for uv to resolve without pulling CUDA
+# versions of torch.
+dependencies = [
+    "transformers==4.57.1",
+    "trl==0.22.2",
+    "peft>=0.13.0",
+    "accelerate>=1.0.0",
+    "datasets>=3.0.0,<5.0.0",
+    "huggingface_hub>=0.26.0",
+    "safetensors>=0.4.5",
+    "sentencepiece>=0.2.0",
+    "protobuf>=4.25.0",
+    "tiktoken>=0.7.0",
+    "hf_transfer>=0.1.8",
+    "wandb>=0.19.0",
+    "pyyaml>=6.0.1",
+    "omegaconf>=2.3.0",
+    "tqdm>=4.66.0",
+    "rich>=13.7.0",
+    "pydantic>=2.0.0",
+    "orjson>=3.10.0",
+]
+
+[project.optional-dependencies]
+env = [
+    # Needed only for eval_compare.py — the local DcOpsEnvironment import
+    "openenv-core[core]>=0.2.1",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.24.0",
+]
+dev = ["pytest>=8.0.0", "ruff>=0.6.0"]
+
+[tool.setuptools.packages.find]
+include = ["dc_ops_sft*"]

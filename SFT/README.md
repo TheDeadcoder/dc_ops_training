@@ -18,3 +18,43 @@ SFT/
     ├── eval_compare.py              # base vs SFT reward on all 6 scenarios
     └── push_to_hub.py               # merged + LoRA to HF Hub
 ```
+
+### Setup and Train
+```bash
+chmod +x install.sh
+./install.sh
+source .venv/bin/activate
+huggingface-cli login
+wandb login 
+```
+
+### Verify the stack
+ 
+```bash
+python - <<'PY'
+import torch, transformers, trl, unsloth
+print(f"torch={torch.__version__}, hip={torch.version.hip}")
+print(f"device={torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+print(f"transformers={transformers.__version__}, trl={trl.__version__}, unsloth={unsloth.__version__}")
+PY
+```
+
+### Train
+ 
+```bash
+python scripts/train_sft.py --config configs/sft.yaml
+```
+
+### Evaluate (base vs SFT)
+Runs 3 episodes per scenario across all 6 scenarios, by default:
+ 
+```bash
+python scripts/eval_compare.py --config configs/sft.yaml \
+    --output ./eval_compare_v1.json
+```
+
+### Push to HuggingFace
+ 
+```bash
+python scripts/push_to_hub.py --config configs/sft.yaml
+```

@@ -1,0 +1,92 @@
+# ============================================================================
+# DC-Ops GRPO config — tuned for AMD Instinct MI300X (192 GB VRAM)
+# ----------------------------------------------------------------------------
+# Memory budget with `gpu_memory_utilization: 0.80`:
+#   vLLM inference pool (KV cache + model weights)    ~ 153 GB
+#   Training side (base 4-bit + LoRA + grads + optim) ~   8 GB
+#   Activations (per_device=8, num_gen=8, seq≈2176)   ~  22 GB
+#   Workspace / fragmentation                         ~   5 GB
+#   ─────────────────────────────────────────────────
+#   total                                             ~ 188 GB  (tight — drop
+#                                                                util to 0.75
+#                                                                if OOM)
+#
+# TRL constraint satisfied:
+#   per_device_train_batch_size(8) * gradient_accumulation_steps(2) % num_generations(8) == 0
+#   → 16 completions / optimizer step, produced from 2 prompts
+# ----------------------------------------------------------------------------
+
+# ----- Data ------------------------------------------------------------------
+data:
+  # For GRPO we need a *tokenizer* to build prompt strings. The tokenizer
+  # comes from the SFT checkpoint (loaded via sft_model below), so the
+  # data section just controls how many prompts we build.
+  num_initial_prompts: 60                  # per scenario (× 6 = 360)
+  num_midgame_prompts: 20                  # per scenario (× 6 = ~120)
+  seed: 42
+  # If set, also load the SFT dataset so the system prompt matches exactly.
+  # Used to re-derive the rewritten system prompt after we load the HF dataset.
+  hf_source: "Melikshah/dc-ops-sft-data"
+  local_jsonl: null
+
+# ----- Model (loaded from the SFT LoRA checkpoint) --------------------------
+model:
+  # This is set to read from the same HF repo SFT pushed to. If you want to
+  # use a local checkpoint instead, set `local_dir` — the script will prefer
+  # it when it exists.
+  sft_model_hub: "Melikshah/dc-ops-sft-lora-new"
+  sft_model_local: "./outputs/dc_ops_sft_lora"
+  max_seq_length: 2048
+  load_in_4bit: true
+  max_lora_rank: 64                        # must match SFT
+
+# ----- vLLM fast-inference ---------------------------------------------------
+vllm:
+  enabled: true
+  gpu_memory_utilization: 0.80             # 153 GB for vLLM, leaving 39 GB
+  enforce_eager: true                      # disables CUDA graphs (unstable on ROCm)
+  temperature: 0.8
+  top_p: 0.95
+
+# ----- GRPO training hyperparams --------------------------------------------
+grpo:
+  output_dir: "./outputs/grpo"
+
+  # Rollout group sizes
+  num_generations: 8                       # 8 completions per prompt → good
+                                           # group-relative advantage signal
+  max_prompt_length: 1792                  # dashboard prompts fit well below this
+  max_completion_length: 384               # EDA: p99 teacher completion ≈ 150 tok
+
+  # Optimizer step sizes
+  per_device_train_batch_size: 8           # 8 completions in flight per step
+  gradient_accumulation_steps: 2           # → 16 completions / optim step = 2 prompts
+
+  num_train_epochs: 4
+  learning_rate: 5.0e-6                    # GRPO is sensitive; keep small
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.1
+  beta: 0.04                               # KL-to-reference penalty
+  max_grad_norm: 0.1                       # GRPO wants tight grad clipping
+
+  bf16: true
+  fp16: false
+
+  logging_steps: 1
+  save_strategy: "steps"
+  save_steps: 50
+  save_total_limit: 3
+
+  dataloader_num_workers: 0                # vLLM + DataLoader workers = fork hell on ROCm
+  seed: 3407
+
+# ----- Save ------------------------------------------------------------------
+save:
+  local_dir: "./outputs/dc_ops_grpo_final"
+
+# ----- Weights & Biases -----------------------------------------------------
+wandb:
+  enabled: true
+  project: "dc-ops-amd"
+  run_name: "grpo-qwen2.5-7b-mi300x"
+  tags: ["grpo", "mi300x", "rocm72", "qwen2.5-7b", "vllm"]

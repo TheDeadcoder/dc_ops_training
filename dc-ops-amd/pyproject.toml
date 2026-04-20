@@ -1,0 +1,78 @@
+# ============================================================================
+# dc-ops-amd: SFT + GRPO pipeline for DC-Ops on AMD Instinct MI300X (ROCm 7.2)
+# ----------------------------------------------------------------------------
+# The preferred install path is `./setup_env.sh` — it handles the ROCm-specific
+# bits (bitsandbytes from source, flash-attn from the ROCm fork, PyTorch from
+# the ROCm wheel index) that a plain pyproject cannot express cleanly.
+#
+# This file exists so that:
+#   (a) `uv sync` installs the Python-only dependencies afterward,
+#   (b) the repo passes basic tooling checks (ruff/mypy) that expect a
+#       pyproject.toml at the root.
+#
+# It INTENTIONALLY does not pin torch / triton / vllm / flash-attn /
+# bitsandbytes / unsloth — those are installed via setup_env.sh from
+# non-PyPI sources. Doing both here would fight the shell installer.
+# ============================================================================
+
+[project]
+name = "dc-ops-amd"
+version = "0.1.0"
+description = "DC-Ops SFT + GRPO training pipeline, tuned for AMD Instinct MI300X / ROCm 7.2"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "BSD-3-Clause" }
+authors = [{ name = "dc-ops training" }]
+
+# Pure-Python dependencies that DON'T conflict with the ROCm stack installed
+# by setup_env.sh. The ROCm-specific packages (torch, bitsandbytes, flash-attn,
+# vllm, unsloth, triton) are installed separately — see setup_env.sh.
+dependencies = [
+    "transformers==4.54.1",
+    "tokenizers==0.21.0",
+    "peft>=0.13,<0.17",
+    "accelerate>=1.2.0",
+    "trl==0.21.0",
+    "huggingface-hub>=0.34.0,<1.0",
+    "datasets>=3.0",
+    "safetensors",
+    "sentencepiece",
+    "protobuf",
+    "wandb",
+    "pyyaml",
+    "python-dotenv",
+    "rich",
+    "tqdm",
+    "openenv-core[core]>=0.2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+# ----- packaging ------------------------------------------------------------
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+# ----- tooling --------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv", ".build", "dc_ops_environment"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "E501",  # line length — we have long URLs in comments
+    "B008",  # default-arg function calls — FastAPI-style is fine
+]

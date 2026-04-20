@@ -1,0 +1,42 @@
+# -----------------------------------------------------------------------------
+# dc-ops-amd .gitignore
+# -----------------------------------------------------------------------------
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# venv / uv
+.venv/
+.build/
+
+# training artifacts
+outputs/
+logs/
+wandb/
+checkpoints/
+
+# dc_ops_env (cloned alongside this repo)
+dc_ops_environment/
+
+# local data files
+data/
+*.jsonl
+!configs/*.yaml
+
+# editor
+.vscode/
+.idea/
+*.swp
+.DS_Store

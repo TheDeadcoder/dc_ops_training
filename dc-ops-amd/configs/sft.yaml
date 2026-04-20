@@ -1,0 +1,98 @@
+# ============================================================================
+# DC-Ops SFT config — tuned for AMD Instinct MI300X (192 GB VRAM)
+# ----------------------------------------------------------------------------
+# Memory budget at max_seq_length=2048, batch=32 (the settings below):
+#   Base model (Qwen2.5-7B, 4-bit NF4)       ~   3.5 GB
+#   LoRA adapter (r=64, 7 modules, bf16)     ~   0.8 GB
+#   LoRA gradients                           ~   0.8 GB
+#   AdamW states (fp32 m/v on LoRA only)     ~   3.2 GB
+#   Activations (FA2, seq=2048, batch=32)    ~  24   GB
+#   vLLM / workspace / fragmentation         ~   5   GB
+#   ─────────────────────────────────────────────────
+#   total                                    ~  37   GB  (of 192 GB — plenty)
+#
+# Dataset stats (from EDA on train.jsonl):
+#   1,083 raw episodes → 934 after VAR_* filter → 7,107 windows
+#   window token lengths: p50≈1580, p99≈1680, max≈1860
+#   → max_seq_length=2048 with packing=True covers 100% without waste
+# ----------------------------------------------------------------------------
+
+# ----- Data ------------------------------------------------------------------
+data:
+  hf_source: "Melikshah/dc-ops-sft-data"  # falls back to this if local is null
+  local_jsonl: null                        # e.g. "./data/train.jsonl" for offline
+  eval_split: 0.05                         # ≈ 355 eval windows
+  seed: 42
+
+# ----- Model -----------------------------------------------------------------
+model:
+  name: "unsloth/Qwen2.5-7B-Instruct"
+  max_seq_length: 2048                     # covers data p99 with headroom
+  load_in_4bit: true                       # 4-bit NF4 via ROCm bitsandbytes
+  attn_implementation: "flash_attention_2" # CK backend on MI300X (gfx942)
+  dtype: "bfloat16"
+
+# ----- LoRA ------------------------------------------------------------------
+lora:
+  r: 64
+  alpha: 64
+  dropout: 0.0
+  bias: "none"
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  # 192 GB VRAM → we do NOT need gradient checkpointing. Turning it off is
+  # worth ~25-40% wall-clock on LoRA SFT.
+  use_gradient_checkpointing: false
+  random_state: 3407
+
+# ----- SFT training hyperparams ---------------------------------------------
+sft:
+  output_dir: "./outputs/sft"
+  # 32 × 1 = 32 effective batch. The notebook used 16 on A100-80GB. MI300X has
+  # 2.4× the VRAM, so we go to 32 with no accumulation → double steps-per-sec.
+  per_device_train_batch_size: 32
+  gradient_accumulation_steps: 1
+
+  num_train_epochs: 3
+  learning_rate: 2.0e-4                    # same as notebook; LoRA is LR-robust
+  lr_scheduler_type: "cosine"
+  warmup_steps: 10
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  bf16: true
+  fp16: false
+
+  # With batch=32, an epoch is ≈7100/32 ≈ 222 steps. Total ≈ 666 steps.
+  logging_steps: 5
+  eval_strategy: "steps"
+  eval_steps: 50
+  save_strategy: "steps"
+  save_steps: 50
+  save_total_limit: 4
+
+  dataloader_num_workers: 8                # 20 vCPUs available
+  dataloader_pin_memory: true
+
+  packing: true                            # concatenate short windows up to max_seq
+  dataset_text_field: "text"
+
+  seed: 3407
+
+# ----- Save / push -----------------------------------------------------------
+save:
+  local_dir: "./outputs/dc_ops_sft_lora"   # where the LoRA ends up
+
+# ----- Weights & Biases -----------------------------------------------------
+wandb:
+  enabled: true
+  project: "dc-ops-amd"
+  run_name: "sft-qwen2.5-7b-mi300x"
+  tags: ["sft", "mi300x", "rocm72", "qwen2.5-7b", "qlora"]
+  # WANDB_API_KEY must be set in the environment (see .env.example).

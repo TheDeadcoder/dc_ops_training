@@ -42,9 +42,18 @@ def apply_rocm_env() -> None:
     _setdefault("MIOPEN_FIND_MODE", "3")
     _setdefault("MIOPEN_FIND_ENFORCE", "3")
 
-    # --- PyTorch allocator (expandable segments reduces OOMs from
-    # fragmentation during long GRPO runs; honoured on ROCm too) ---
-    _setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True")
+    # --- PyTorch allocator config ---
+    # NOTE: We intentionally do NOT set PYTORCH_HIP_ALLOC_CONF or
+    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here. The user's
+    # torch 2.10.0+rocm7.1 build does NOT support that flag and triggers
+    # this warning every time a CUDA tensor is created:
+    #   "expandable_segments not supported on this platform"
+    # On MI300X the default rocBLAS allocator is fine — fragmentation
+    # hasn't been a problem in practice on a 192 GB device for our workload.
+    # If you upgrade to a torch build that supports it (look for it being
+    # honored silently on first tensor allocation), uncomment:
+    # _setdefault("PYTORCH_HIP_ALLOC_CONF",  "expandable_segments:True")
+    # _setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     # --- vLLM on ROCm ---
     # ROCm doesn't support fork(); vLLM must use spawn.

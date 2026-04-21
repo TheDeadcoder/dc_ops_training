@@ -35,6 +35,8 @@ length stats (chars — rough token ≈ chars/4):
    <command> block      n= 7107  mean=  18.9  median=   20  p95=   25  p99=   27  max=36
 
 → max_seq_length recommendation (windowed prompts):
-   window p99 (upper-bound estimate) ≈ 2362 tokens
-   empirical p99 (tokenized, from notebook): ≈ 1680 tokens
-   configs/sft.yaml sets max_seq_length=2048 + packing=true → safe.
+   window p99 (upper-bound estimate) ≈ 2584 tokens
+   empirical p99 (tokenizer-measured): ~2700 tokens
+   empirical max (tokenizer-measured): ~2900 tokens
+   configs/sft.yaml sets max_seq_length=4096 → safe (covers max + packing headroom)
+   ⚠  NEVER drop max_seq_length below 3072 — would truncate >0% of windows

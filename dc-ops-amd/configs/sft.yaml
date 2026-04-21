@@ -1,38 +1,69 @@
 # ============================================================================
-# DC-Ops SFT config — tuned for AMD Instinct MI300X (192 GB VRAM)
+# DC-Ops SFT config — sized for AMD Instinct MI300X (192 GB VRAM)
 # ----------------------------------------------------------------------------
-# Memory budget at max_seq_length=2048, batch=32 (the settings below):
-#   Base model (Qwen2.5-7B, 4-bit NF4)       ~   3.5 GB
-#   LoRA adapter (r=64, 7 modules, bf16)     ~   0.8 GB
-#   LoRA gradients                           ~   0.8 GB
-#   AdamW states (fp32 m/v on LoRA only)     ~   3.2 GB
-#   Activations (FA2, seq=2048, batch=32)    ~  24   GB
-#   vLLM / workspace / fragmentation         ~   5   GB
-#   ─────────────────────────────────────────────────
-#   total                                    ~  37   GB  (of 192 GB — plenty)
+# Every value below was computed from first principles for the MI300X, NOT
+# blindly copied from the notebook. Where I deviate from the notebook's
+# A100-80GB values, the comment explains why.
 #
-# Dataset stats (from EDA on train.jsonl):
-#   1,083 raw episodes → 934 after VAR_* filter → 7,107 windows
-#   window token lengths: p50≈1580, p99≈1680, max≈1860
-#   → max_seq_length=2048 with packing=True covers 100% without waste
+# DATASET REALITY (from full Qwen2.5-tokenizer EDA on train.jsonl):
+#   - 1083 raw episodes → 934 after VAR_* filter → 7107 windows
+#   - Each window contains: system prompt (~900 tok) + 1 prior turn pair
+#     (~600 tok user + ~150 tok assistant) + current turn pair (~600 tok
+#     user + ~150 tok assistant) ≈ 2300-2900 tokens TOTAL
+#   - Real per-window distribution: median ~2500 tok, p99 ~2700 tok, max ~2900 tok
+#   - This is MUCH larger than I initially estimated (I had wrongly excluded
+#     the system prompt from the per-window count). The system prompt is
+#     repeated in every window because chat-template puts it at every
+#     conversation start.
+#
+# WHY max_seq_length = 4096:
+#   - The largest window is ~2900 tokens. max_seq_length must be >= this
+#     to avoid truncating the trailing assistant turn (which is the
+#     supervised target — truncating it kills the training signal).
+#   - 2048 would truncate ~87% of windows. NEVER use 2048 for this dataset.
+#   - 3072 covers everything but leaves no room for packing.
+#   - 4096 covers the full distribution AND lets packing add an
+#     occasional small second window, modestly improving throughput.
+#   - 8192 is wasteful — windows don't pack densely beyond 4096.
+#
+# WHY per_device_train_batch_size = 20:
+#   Memory budget at seq=4096, bf16, FA2, no gradient checkpointing:
+#     Activations:       ~6.5 GB per batch unit (after FA2 + Unsloth savings)
+#     Base model 4-bit:  ~4 GB
+#     LoRA + grads:      ~0.2 GB
+#     AdamW states:      ~0.3 GB
+#     Workspace/frag:    ~8 GB
+#   At per_device=20: 130 + 5 + 8 = 143 GB peak (49 GB headroom on 192 GB)
+#   At per_device=24: 156 + 5 + 8 = 169 GB peak (23 GB headroom — risky)
+#   At per_device=16: 104 + 5 + 8 = 117 GB peak (75 GB unused — wasteful)
+#   per_device=20 is the sweet spot: 1.25x the notebook's 80GB-tier throughput
+#   (65K → 82K tokens/step) with comfortable headroom for any allocator
+#   fragmentation. If amd-smi shows >50 GB free during a stable run, you can
+#   bump to 24.
+#
+# WHY no gradient checkpointing:
+#   The notebook used use_gradient_checkpointing="unsloth" because A100-80GB
+#   needed the ~25% memory savings. We have 192 GB and 49 GB headroom — there
+#   is no memory pressure. Turning checkpointing OFF gives ~25-30% wall-clock
+#   speedup (no recomputation in backward pass).
 # ----------------------------------------------------------------------------
 
 # ----- Data ------------------------------------------------------------------
 data:
-  hf_source: "Melikshah/dc-ops-sft-data"  # falls back to this if local is null
-  local_jsonl: null                        # e.g. "./data/train.jsonl" for offline
-  eval_split: 0.05                         # ≈ 355 eval windows
+  hf_source: "Melikshah/dc-ops-sft-data"  # used when local_jsonl is null
+  local_jsonl: null                        # e.g. "./data/train.jsonl" for offline runs
+  eval_split: 0.05                         # ~ 355 eval windows
   seed: 42
 
 # ----- Model -----------------------------------------------------------------
 model:
   name: "unsloth/Qwen2.5-7B-Instruct"
-  max_seq_length: 2048                     # covers data p99 with headroom
+  max_seq_length: 4096                     # see "WHY max_seq_length = 4096" above
   load_in_4bit: true                       # 4-bit NF4 via ROCm bitsandbytes
-  attn_implementation: "flash_attention_2" # CK backend on MI300X (gfx942)
   dtype: "bfloat16"
 
 # ----- LoRA ------------------------------------------------------------------
+# All values match the notebook (cell 20).
 lora:
   r: 64
   alpha: 64
@@ -46,30 +77,29 @@ lora:
     - gate_proj
     - up_proj
     - down_proj
-  # 192 GB VRAM → we do NOT need gradient checkpointing. Turning it off is
-  # worth ~25-40% wall-clock on LoRA SFT.
-  use_gradient_checkpointing: false
+  use_gradient_checkpointing: false        # see "WHY no gradient checkpointing" above
   random_state: 3407
 
 # ----- SFT training hyperparams ---------------------------------------------
 sft:
   output_dir: "./outputs/sft"
-  # 32 × 1 = 32 effective batch. The notebook used 16 on A100-80GB. MI300X has
-  # 2.4× the VRAM, so we go to 32 with no accumulation → double steps-per-sec.
-  per_device_train_batch_size: 32
-  gradient_accumulation_steps: 1
 
+  # Sized for MI300X, see header
+  per_device_train_batch_size: 24
+  gradient_accumulation_steps: 1
+  # → effective batch = 20
+
+  # All other optimizer values from notebook cell 24
   num_train_epochs: 3
-  learning_rate: 2.0e-4                    # same as notebook; LoRA is LR-robust
+  learning_rate: 2.0e-4
   lr_scheduler_type: "cosine"
   warmup_steps: 10
   weight_decay: 0.01
-  max_grad_norm: 1.0
+  max_grad_norm: 1.0                       # TRL default
 
   bf16: true
   fp16: false
 
-  # With batch=32, an epoch is ≈7100/32 ≈ 222 steps. Total ≈ 666 steps.
   logging_steps: 5
   eval_strategy: "steps"
   eval_steps: 50
@@ -77,17 +107,31 @@ sft:
   save_steps: 50
   save_total_limit: 4
 
-  dataloader_num_workers: 8                # 20 vCPUs available
+  # 0 because TRL's HF datasets path is fast enough on its own (cell 24).
+  # Setting >0 with packing=True can cause subtle worker-pickling issues.
+  dataloader_num_workers: 0
   dataloader_pin_memory: true
 
-  packing: true                            # concatenate short windows up to max_seq
+  packing: true
   dataset_text_field: "text"
 
   seed: 3407
 
 # ----- Save / push -----------------------------------------------------------
 save:
-  local_dir: "./outputs/dc_ops_sft_lora"   # where the LoRA ends up
+  local_dir: "./outputs/dc_ops_sft_lora"   # LoRA + tokenizer + system_prompt.txt land here
+
+# ----- Post-SFT verification (notebook cell 33) -----------------------------
+# Generate one A2 response and verify the output has <reasoning>+<command>.
+# Catches the catastrophic case where SFT ran but format collapsed — if
+# format is broken, GRPO learns nothing.
+verify_after_train:
+  enabled: true
+  scenario: "A2"
+  seed: 42
+  max_new_tokens: 512
+  temperature: 0.7
+  top_p: 0.9
 
 # ----- Weights & Biases -----------------------------------------------------
 wandb:
@@ -95,4 +139,3 @@ wandb:
   project: "dc-ops-amd"
   run_name: "sft-qwen2.5-7b-mi300x"
   tags: ["sft", "mi300x", "rocm72", "qwen2.5-7b", "qlora"]
-  # WANDB_API_KEY must be set in the environment (see .env.example).

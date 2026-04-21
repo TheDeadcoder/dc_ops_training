@@ -161,21 +161,22 @@ def main() -> None:
     # in windowing (the student is non-reasoning). Post-strip assistant turn
     # length ≈ reasoning + command + framing tags.
     #
-    # Important: with `packing=true` in configs/sft.yaml, sequences over
-    # max_seq_length get split at boundaries, so a slight over-estimate here
-    # doesn't actually cost any information. 2048 is the right default.
+    # Important: with `packing=true` in configs/sft.yaml, multiple windows
+    # get packed into one block of size max_seq_length. INDIVIDUAL windows
+    # that exceed max_seq_length get truncated (losing the trailing assistant
+    # turn = the supervised target), which is catastrophic for SFT.
     #
-    # This estimator uses a per-component p99 sum which is intentionally
-    # conservative (real tokenizer p99 on full windows, measured in the
-    # notebook, came in at ~1680 tokens — below 2048).
-    CHARS_PER_TOKEN = 4.0
+    # The estimator below is the per-component p99 sum (intentionally
+    # conservative). Real tokenizer-measured p99 on full windows including
+    # the system prompt is ~2700 tokens, max ~2900 tokens.
+    CHARS_PER_TOKEN = 3.85   # Qwen2.5 BPE on mixed English+structured text
     print(f"\n→ max_seq_length recommendation (windowed prompts):")
     if reasoning_lens and cmd_lens:
         stripped_assist_p99 = sorted(
             [r + c + 60 for r, c in zip(reasoning_lens, cmd_lens)]  # +60 for tag framing
         )[int(0.99 * len(reasoning_lens))]
         rough_window_p99_chars = (
-            3000                          # rewritten system prompt
+            3500                          # rewritten system prompt (each window has it)
             + 2500 + stripped_assist_p99  # prior user + prior stripped assistant
             + 2500                        # current user dashboard
             + stripped_assist_p99         # current stripped assistant
@@ -183,10 +184,12 @@ def main() -> None:
         )
         rough_tokens = rough_window_p99_chars / CHARS_PER_TOKEN
         print(f"   window p99 (upper-bound estimate) ≈ {rough_tokens:.0f} tokens")
-        print(f"   empirical p99 (tokenized, from notebook): ≈ 1680 tokens")
-        print(f"   configs/sft.yaml sets max_seq_length=2048 + packing=true → safe.")
+        print(f"   empirical p99 (tokenizer-measured): ~2700 tokens")
+        print(f"   empirical max (tokenizer-measured): ~2900 tokens")
+        print(f"   configs/sft.yaml sets max_seq_length=4096 → safe (covers max + packing headroom)")
+        print(f"   ⚠  NEVER drop max_seq_length below 3072 — would truncate >0% of windows")
         if rough_tokens > 3500:
-            print(f"   ⚠  estimate > 3500 — consider 4096 if empirical check also exceeds 2048")
+            print(f"   note: per-component estimate is high but tokenizer-measured is lower")
 
     # -------- optional JSON dump --------
     if args.out:

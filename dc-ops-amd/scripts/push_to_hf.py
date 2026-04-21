@@ -62,6 +62,15 @@ def main() -> None:
         raise FileNotFoundError(
             f"{local_dir}/adapter_config.json missing — is this really a LoRA adapter dir?"
         )
+    # GRPO will recover the rewritten system prompt from this file. Loud
+    # warning if it's missing — GRPO falls back to re-deriving from the
+    # raw dataset, but having the file makes GRPO independent of HF dataset
+    # availability.
+    if not (local_dir / "system_prompt.txt").exists():
+        print(f"[push] !! warning: system_prompt.txt missing in {local_dir}")
+        print(f"[push] !!          GRPO will fall back to re-deriving from the raw dataset.")
+    else:
+        print(f"[push] OK — system_prompt.txt present (will travel with the LoRA)")
 
     from huggingface_hub import login, HfApi
     login(token=token)

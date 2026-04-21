@@ -1,26 +1,4 @@
-# Copyright (c) 2026
-# SPDX-License-Identifier: BSD-3-Clause
-"""
-GRPO reward functions for DC-Ops (v3 — redesigned from the notebook).
-
-Four signals combine to drive learning:
-
-    1. format_reward_fn    — [-1.5, +1.0]  structural tags + known verb +
-                                           trailing-text check. Does NOT
-                                           saturate for SFT-perfect outputs.
-    2. env_reward_fn       — [-3.0, +3.0]  runs the model's command in the
-                                           real physics simulator (after
-                                           replaying any warmup actions),
-                                           with resolution / crash bonuses
-                                           and a downstream-stability probe.
-    3. command_quality_fn  — [-1.0, +1.0]  scenario-aware heuristic priors
-                                           on first-turn vs mid-game actions.
-    4. no_repeat_fn        — [-0.5,  0.0]  small penalty for mirroring the
-                                           most recent warmup action.
-
-GRPO does group-relative baselining internally, so we hand it the sum of
-these four raw signals with no further baseline subtraction.
-"""
+"""GRPO reward functions for DC-Ops (v4)."""
 
 from __future__ import annotations
 
@@ -37,9 +15,6 @@ from .constants import (
     RESOLVE_KEYWORDS,
 )
 
-# ---------------------------------------------------------------------------
-# Regexes / extractors
-# ---------------------------------------------------------------------------
 _CMD_RE       = re.compile(r"<command>\s*(.+?)\s*</command>",       re.DOTALL)
 _REASONING_RE = re.compile(r"<reasoning>\s*(.+?)\s*</reasoning>",   re.DOTALL)
 
@@ -55,11 +30,6 @@ def extract_reasoning(text: str) -> str | None:
 
 
 def _completion_text(completion) -> str:
-    """Normalise the many shapes TRL hands a reward function.
-
-    TRL may pass a plain string, a {'content': ...} dict, or a
-    list-of-dicts (multi-turn). We peek at the first content block.
-    """
     if isinstance(completion, list) and completion and isinstance(completion[0], dict):
         return completion[0].get("content", "")
     if isinstance(completion, dict):
@@ -68,33 +38,98 @@ def _completion_text(completion) -> str:
 
 
 def _pick(value, i: int, default=None):
-    """Index into a list-or-scalar kwarg.
-
-    TRL hands scalars to the reward when the dataset row has a single value
-    and lists otherwise. This helper collapses both shapes.
-    """
     if isinstance(value, list):
         return value[i] if i < len(value) else default
     return value if value is not None else default
 
 
+# ---------------------------------------------------------------------------
+# Proxy health score — scenario-agnostic [0, 1] signal from live sim state.
+# Replaces the unreachable `scenario.resolved` gate at RL time.
+# ---------------------------------------------------------------------------
+def _proxy_health(env) -> float:
+    """Compute [0, 1] health score from env._thermal_sim and env._power_sim.
+
+    Thermal half: fraction of zones within ASHRAE recommended range,
+      smoothly degrading through allowable and beyond.
+    Power half: avg UPS battery SOC + generator-readiness-during-outage.
+    """
+    try:
+        from dc_ops_env.config import ASHRAE_CLASSES
+    except Exception:
+        ASHRAE_CLASSES = {}
+
+    score = 0.0
+    weight = 0.0
+
+    thermal = getattr(env, "_thermal_sim", None)
+    if thermal is not None:
+        try:
+            zone_scores: list[float] = []
+            for zone in thermal.state.zones:
+                ashrae = ASHRAE_CLASSES.get(zone.ashrae_class)
+                if not ashrae:
+                    continue
+                t = zone.max_inlet_temp_c
+                rec = ashrae.recommended_max_c
+                allow = ashrae.allowable_max_c
+                span = max(1e-6, allow - rec)
+                if t <= rec:
+                    s = 1.0
+                elif t <= allow:
+                    s = 1.0 - 0.5 * (t - rec) / span
+                else:
+                    s = max(0.0, 0.5 - 0.1 * (t - allow))
+                zone_scores.append(s)
+            if zone_scores:
+                score += 0.5 * (sum(zone_scores) / len(zone_scores))
+                weight += 0.5
+        except Exception:
+            pass
+
+    power = getattr(env, "_power_sim", None)
+    if power is not None:
+        try:
+            sub = 0.0
+            socs = [u.battery_soc for u in power.state.ups_units]
+            if socs:
+                sub += 0.5 * (sum(socs) / len(socs))
+
+            any_on_battery = False
+            for u in power.state.ups_units:
+                mode_v = getattr(u.mode, "value", str(u.mode))
+                if mode_v == "on_battery":
+                    any_on_battery = True
+                    break
+
+            gen = power.state.generator
+            gen_v = getattr(gen.state, "value", str(gen.state))
+            if any_on_battery:
+                if gen_v == "loaded":
+                    sub += 0.5
+                elif gen_v in ("ready", "warming"):
+                    sub += 0.35
+                elif gen_v in ("cranking", "start_delay"):
+                    sub += 0.2
+            else:
+                sub += 0.5
+
+            score += 0.5 * sub
+            weight += 0.5
+        except Exception:
+            pass
+
+    return score / weight if weight > 0 else 0.5
+
+
 # ═══════════════════════════════════════════════════════════════════════════
-# 1) format_reward_fn
+# 1) format_reward_fn — negative-dominant, does NOT saturate
 # ═══════════════════════════════════════════════════════════════════════════
 def format_reward_fn(completions, **kwargs):
-    """Structural check with real spread (doesn't saturate for SFT-clean outputs).
-
-    Score recipe:
-      + 0.6  both <reasoning> and <command> tags closed
-      + 0.2  first token of command is a known verb
-      + 0.2  no trailing junk (< 30 chars) after </command>
-      − 0.5  command-only (no reasoning)
-      − 0.8  reasoning-only (no command)
-      − 1.0  neither tag
-      − 0.5  a stray <think> block leaked through (student is non-reasoning)
-      − 0.4  command verb is unknown
-      − 0.2  trailing junk after </command>
-    Clipped to [-1.5, +1.0].
+    """Asymmetric structural check. Clean outputs land in [-0.2, +0.3];
+    malformed outputs land in [-1.5, -0.4]. The deliberate lack of a flat
+    +1.0 ceiling prevents the group-mean advantage from collapsing when the
+    SFT checkpoint already emits clean format (your observed failure mode).
     """
     rewards = []
     for completion in completions:
@@ -104,37 +139,45 @@ def format_reward_fn(completions, **kwargs):
         has_command   = bool(_CMD_RE.search(text))
         has_think     = "<think>" in text
 
+        if not has_command and not has_reasoning:
+            rewards.append(-1.5)
+            continue
+        if not has_command:
+            rewards.append(-1.0)
+            continue
+        if not has_reasoning:
+            rewards.append(-0.6)
+            continue
+
         cmd = extract_command(text) or ""
+        reasoning = extract_reasoning(text) or ""
         cmd_head = cmd.strip().split()[0].lower() if cmd.strip() else ""
 
-        reward = 0.0
-        if has_reasoning and has_command:
-            reward += 0.6
-        elif has_command:
-            reward -= 0.5
-        elif has_reasoning:
-            reward -= 0.8
-        else:
-            reward -= 1.0
-
+        r = 0.0
         if has_think:
-            reward -= 0.5
-
-        if cmd_head in KNOWN_COMMANDS:
-            reward += 0.2
-        elif cmd_head:
-            reward -= 0.4
-
+            r -= 0.4
+        if cmd_head and cmd_head not in KNOWN_COMMANDS:
+            r -= 0.5
         if "</command>" in text:
-            after = text.split("</command>")[-1].strip()
-            reward += 0.2 if len(after) < 30 else -0.2
+            tail = text.split("</command>")[-1].strip()
+            if len(tail) > 30:
+                r -= 0.2
 
-        rewards.append(max(-1.5, min(1.0, reward)))
+        # Reasoning-length sweet spot — creates within-group variance
+        n_words = len(reasoning.split())
+        if n_words < 8:
+            r -= 0.2
+        elif n_words > 260:
+            r -= 0.2
+        elif 25 <= n_words <= 180:
+            r += 0.15
+
+        rewards.append(max(-1.5, min(0.3, r)))
     return rewards
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 2) env_reward_fn
+# 2) env_reward_fn — physics reward with proxy-health delta
 # ═══════════════════════════════════════════════════════════════════════════
 def env_reward_fn(
     completions,
@@ -144,20 +187,17 @@ def env_reward_fn(
     warmup_actions=None,
     **kwargs,
 ):
-    """Physics reward: replay warmup → step the model's command → probe
-    downstream stability → combine with resolution/crash bonuses.
+    """Physics + proxy-resolution. Replaces the unreachable `resolved` gate
+    with a continuous health-delta signal that is earnable in 1–5 steps.
 
-    Raw env step-reward is in [-1, 1]. We scale that by 3, then:
-      + 2.5 on scenario resolution (seen in alert text of a done episode)
-      − 3.0 on catastrophic termination
-      − 3.0 on `escalate` (hard-coded — handing off is the worst move)
-      + mean(next 2 wait-step rewards)  as a stability probe (weight 1)
-    Final clipped to [-3.0, +3.0].
-
-    Imports DcOpsEnvironment lazily so this module can be imported in
-    contexts without the env (e.g. format-only sanity tests).
+    Composition:
+      r_now * 3.0                  (env's own clamped reward for this action)
+      + (proxy_after - before) * 2.5   (immediate effect of the action)
+      + (best_proxy  - before) * 1.0   (stability over 4-wait probe)
+      + 3.0 on resolve (if it happens inside the probe)
+      - 3.0 on crash
+    Clamped to [-4.0, +5.0]. This is ~2× the range / 3× the variance of v3.
     """
-    # Local import — avoids import-order headaches
     from dc_ops_env.server.dc_ops_env_environment import DcOpsEnvironment
     from dc_ops_env.models import DcOpsAction
 
@@ -172,7 +212,7 @@ def env_reward_fn(
         warmup = _pick(warmup_actions, i, []) or []
 
         if cmd is None:
-            rewards.append(-2.5)
+            rewards.append(-3.0)
             continue
         if sid is None:
             rewards.append(-1.0)
@@ -180,14 +220,13 @@ def env_reward_fn(
 
         cmd_head = cmd.strip().split()[0].lower() if cmd.strip() else ""
         if cmd_head == "escalate":
-            rewards.append(-3.0)
+            rewards.append(-3.5)
             continue
 
         try:
             env = DcOpsEnvironment()
             env.reset(scenario=sid, seed=s)
 
-            # Replay warmup so the state matches what the model was shown
             aborted = False
             for w in warmup:
                 _o = env.step(DcOpsAction(command=w))
@@ -195,134 +234,238 @@ def env_reward_fn(
                     aborted = True
                     break
             if aborted:
-                rewards.append(0.0)
+                rewards.append(-0.5)
                 continue
 
-            # Apply the model's action
+            proxy_before = _proxy_health(env)
+
             obs = env.step(DcOpsAction(command=cmd, reasoning=reasoning))
             r_now = float(obs.reward)
+            proxy_after = _proxy_health(env)
 
             alert_l = (obs.alert or "").lower()
-            resolved_now = obs.done and any(k in alert_l for k in RESOLVE_KEYWORDS)
-            crashed_now  = obs.done and any(k in alert_l for k in CRASH_KEYWORDS)
+            resolved = obs.done and any(k in alert_l for k in RESOLVE_KEYWORDS)
+            crashed  = obs.done and any(k in alert_l for k in CRASH_KEYWORDS)
 
-            # Roll 2 "wait" steps forward — probes downstream stability
-            r_future, n_future = 0.0, 0
-            resolved_future = crashed_future = False
-            for _ in range(2):
+            best_proxy = proxy_after
+            for _ in range(4):
                 if obs.done:
                     break
                 obs = env.step(DcOpsAction(command="wait"))
-                r_future += float(obs.reward)
-                n_future += 1
+                p = _proxy_health(env)
+                if p > best_proxy:
+                    best_proxy = p
                 alert_l = (obs.alert or "").lower()
                 if obs.done:
                     if any(k in alert_l for k in RESOLVE_KEYWORDS):
-                        resolved_future = True
+                        resolved = True
                     elif any(k in alert_l for k in CRASH_KEYWORDS):
-                        crashed_future = True
+                        crashed = True
 
-            combined = r_now * 3.0
-            if n_future > 0:
-                combined += (r_future / n_future) * 1.0
-            if resolved_now or resolved_future:
-                combined += 2.5
-            if crashed_now or crashed_future:
+            delta_immediate = proxy_after - proxy_before
+            delta_best      = best_proxy  - proxy_before
+
+            combined = (
+                r_now * 3.0
+                + delta_immediate * 2.5
+                + delta_best * 1.0
+            )
+            if resolved:
+                combined += 3.0
+            if crashed:
                 combined -= 3.0
 
-            rewards.append(max(-3.0, min(3.0, combined)))
+            rewards.append(max(-4.0, min(5.0, combined)))
         except Exception:
-            rewards.append(-1.5)
+            rewards.append(-2.0)
 
     return rewards
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 3) command_quality_fn
+# 3) command_quality_fn — per-verb target alignment + param quality
 # ═══════════════════════════════════════════════════════════════════════════
 def command_quality_fn(completions, scenario_id=None, warmup_actions=None, **kwargs):
-    """Scenario-aware heuristic: first-turn priors, mid-game priors,
-    target-alignment bonus, domain-vocabulary bonus on reasoning.
-    Range [-1.0, +1.0].
+    """Scenario-aware heuristic priors, split by verb so that operating the
+    correct target is rewarded and operating the failed unit is penalized.
+    Also penalizes overcooling (setpoint <17°C) and under-shedding.
+    Range [-1.5, +1.2].
     """
     rewards = []
     for i, completion in enumerate(completions):
         text = _completion_text(completion)
         cmd  = extract_command(text)
         if cmd is None:
-            rewards.append(-0.8)
+            rewards.append(-1.0)
             continue
 
         sid       = _pick(scenario_id, i, None)
         warmup    = _pick(warmup_actions, i, []) or []
         reasoning = extract_reasoning(text) or ""
-        reward    = 0.0
+        r         = 0.0
 
-        cmd_head   = cmd.strip().split()[0].lower()
-        cmd_upper  = cmd.upper()
-        is_midgame = bool(warmup)
+        cmd_lower = cmd.strip().lower()
+        cmd_upper = cmd.upper()
+        parts     = cmd_lower.split()
+        cmd_head  = parts[0] if parts else ""
+        cmd_value: float | None = None
+        if len(parts) >= 3:
+            try:
+                cmd_value = float(parts[2])
+            except ValueError:
+                cmd_value = None
 
+        is_midgame     = bool(warmup)
+        warmup_lower   = [w.strip().lower() for w in warmup]
+        warmup_heads   = [w.split()[0] for w in warmup_lower if w]
+        has_diagnosed  = any(h == "diagnose" for h in warmup_heads)
+        has_start_gen  = any("start_generator" in w for w in warmup_lower)
+
+        # --- Turn-phase priors -------------------------------------------------
         if sid:
             if not is_midgame:
                 if cmd_head in OPTIMAL_FIRST_ACTIONS.get(sid, set()):
-                    reward += 0.6
+                    r += 0.5
                 elif cmd_head in GOOD_FIRST_ACTIONS.get(sid, set()):
-                    reward += 0.25
+                    r += 0.2
                 elif cmd_head in BAD_FIRST_ACTIONS:
-                    reward -= 0.6
+                    r -= 0.6
                 elif cmd_head == "wait":
-                    reward -= 0.3  # waiting on turn 1 gathers no info
+                    r -= 0.4
             else:
                 post = POST_DIAGNOSIS_ACTIONS.get(sid, set())
                 if cmd_head in post:
-                    reward += 0.5
+                    r += 0.4
                 elif cmd_head in BAD_FIRST_ACTIONS:
-                    reward -= 0.6
+                    r -= 0.6
                 elif cmd_head == "diagnose":
-                    already_diagnosed = any(
-                        w.lower().startswith("diagnose")
-                        and w.strip().split()[1:2] == cmd.strip().split()[1:2]
-                        for w in warmup
+                    same_target = any(
+                        w.split()[:2] == cmd_lower.split()[:2] for w in warmup_lower
                     )
-                    reward += -0.1 if already_diagnosed else 0.25
+                    r += -0.25 if same_target else (0.15 if not has_diagnosed else -0.1)
                 elif cmd_head == "check_status":
-                    reward += 0.1
-                elif cmd_head == "wait":
-                    reward += 0.05
+                    r += 0.05
 
-        # Target-alignment — picking the right unit for the scenario
-        if sid == "A2" and "CRAC-3" in cmd_upper:
-            reward += 0.2
-        elif sid == "A4" and ("CRAC-1" in cmd_upper or "CRAC-3" in cmd_upper):
-            reward += 0.2
-        elif sid == "B1" and "UPS" in cmd_upper:
-            reward += 0.2
-        elif sid == "B3" and "GEN" in cmd_upper:
-            reward += 0.2
-        elif sid == "B4" and ("UPS" in cmd_upper or "GEN" in cmd_upper):
-            reward += 0.2
+        # --- Per-scenario target/value alignment (the big fix) ----------------
+        if sid == "A4":
+            # Failed: CRAC-1, CRAC-3. Survivors: CRAC-2, CRAC-4.
+            if cmd_head == "diagnose":
+                if "CRAC-1" in cmd_upper or "CRAC-3" in cmd_upper:
+                    r += 0.3
+                else:
+                    r -= 0.1
+            elif cmd_head == "set_fan_speed":
+                if "CRAC-2" in cmd_upper or "CRAC-4" in cmd_upper:
+                    r += 0.3
+                    if cmd_value is not None and cmd_value >= 90:
+                        r += 0.2
+                elif "CRAC-1" in cmd_upper or "CRAC-3" in cmd_upper:
+                    r -= 0.4
+            elif cmd_head == "adjust_setpoint":
+                if "CRAC-2" in cmd_upper or "CRAC-4" in cmd_upper:
+                    r += 0.1
+                elif "CRAC-1" in cmd_upper or "CRAC-3" in cmd_upper:
+                    r -= 0.35
+                if cmd_value is not None:
+                    if cmd_value < 17:
+                        r -= 0.3        # overcool — penalise 16.0 setpoints
+                    elif 18 <= cmd_value <= 22:
+                        r += 0.15
+            elif cmd_head == "set_rack_load":
+                if cmd_value is not None:
+                    if cmd_value <= 5:
+                        r += 0.3
+                    elif cmd_value <= 7:
+                        r += 0.1
+                    else:
+                        r -= 0.15
 
-        # Small domain-vocab bonus on reasoning
-        domain_terms = {
-            "temperature", "thermal", "crac", "cooling",
-            "compressor", "fan", "setpoint",
-            "ups", "battery", "generator", "power",
-            "load", "diagnose", "fault", "alarm",
+        elif sid == "A2":
+            # Failed: CRAC-3.
+            if cmd_head == "diagnose":
+                if "CRAC-3" in cmd_upper:
+                    r += 0.35
+                else:
+                    r -= 0.1
+            elif cmd_head in ("set_fan_speed", "adjust_setpoint"):
+                if "CRAC-3" in cmd_upper:
+                    r -= 0.3
+                elif any(f"CRAC-{n}" in cmd_upper for n in (1, 2, 4)):
+                    r += 0.2
+                if cmd_head == "set_fan_speed" and cmd_value is not None and cmd_value >= 90:
+                    r += 0.15
+                if cmd_head == "adjust_setpoint" and cmd_value is not None:
+                    if cmd_value < 17:
+                        r -= 0.25
+                    elif 18 <= cmd_value <= 22:
+                        r += 0.1
+
+        elif sid == "A1":
+            # PUE optimisation — raise setpoints toward 20-24.
+            if cmd_head == "adjust_setpoint" and cmd_value is not None:
+                if 20 <= cmd_value <= 25:
+                    r += 0.3
+                elif cmd_value < 18:
+                    r -= 0.3
+            if cmd_head == "check_status" and not is_midgame:
+                r += 0.15
+
+        elif sid == "B1":
+            if cmd_head == "diagnose" and "UPS" in cmd_upper:
+                r += 0.4
+            elif cmd_head == "acknowledge_alarm":
+                r += 0.3 if has_diagnosed else -0.1
+
+        elif sid == "B3":
+            if cmd_head == "check_status" and not is_midgame:
+                r += 0.3
+            elif cmd_head == "start_generator":
+                r += -0.3 if has_start_gen else 0.3
+            elif cmd_head == "diagnose" and "GEN" in cmd_upper:
+                r += 0.2
+            elif cmd_head == "stop_generator":
+                r += 0.3 if has_start_gen else -0.3
+
+        elif sid == "B4":
+            if cmd_head == "diagnose":
+                if "UPS" in cmd_upper:
+                    r += 0.4
+                elif "GEN" in cmd_upper:
+                    r += 0.1
+            elif cmd_head == "start_generator":
+                r += -0.2 if has_start_gen else 0.5
+            elif cmd_head == "set_rack_load" and cmd_value is not None:
+                if cmd_value <= 4:
+                    r += 0.35
+                elif cmd_value <= 6:
+                    r += 0.15
+                else:
+                    r -= 0.1
+            elif cmd_head == "wait" and not has_start_gen:
+                r -= 0.2    # waiting while utility lost and gen not started is bad
+
+        # --- Domain vocab bonus (moderate) -----------------------------------
+        domain = {
+            "temperature", "thermal", "crac", "cooling", "compressor", "fan",
+            "setpoint", "ups", "battery", "generator", "power", "load",
+            "diagnose", "fault", "alarm", "shed", "pue", "ashrae", "inlet",
         }
-        term_count = sum(1 for t in domain_terms if t in reasoning.lower())
-        reward += min(0.2, term_count * 0.03)
+        n = sum(1 for t in domain if t in reasoning.lower())
+        r += min(0.15, n * 0.02)
 
-        rewards.append(max(-1.0, min(1.0, reward)))
+        rewards.append(max(-1.5, min(1.2, r)))
     return rewards
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 4) no_repeat_fn
+# 4) no_repeat_fn — penalises repeat of ANY warmup action, not just the last
 # ═══════════════════════════════════════════════════════════════════════════
 def no_repeat_fn(completions, warmup_actions=None, **kwargs):
-    """Small penalty for mirroring the most recent warmup action.
-
-    `wait` and `check_status` are exempt — they're legitimately repeatable.
+    """Catches:
+      - exact duplicate of any warmup action (hard penalty)
+      - same verb+target as any warmup action but different value (soft penalty)
+      - waiting when warmup already contains a wait (loitering)
+    `wait` and `check_status` without warmup-repeats remain neutral.
     """
     rewards = []
     for i, completion in enumerate(completions):
@@ -330,19 +473,43 @@ def no_repeat_fn(completions, warmup_actions=None, **kwargs):
         cmd  = extract_command(text)
         warmup = _pick(warmup_actions, i, []) or []
 
-        if cmd is None or not warmup:
+        if cmd is None:
+            rewards.append(-0.3)
+            continue
+        if not warmup:
             rewards.append(0.0)
             continue
 
-        last = warmup[-1].strip().lower()
-        this = cmd.strip().lower()
-        head = this.split()[0] if this else ""
+        cmd_norm = cmd.strip().lower()
+        parts    = cmd_norm.split()
+        head     = parts[0] if parts else ""
+
+        warmup_norms = [w.strip().lower() for w in warmup]
+
         if head in {"wait", "check_status"}:
-            rewards.append(0.0)
+            # Mild penalty for redundant waits — only if multiple waits already queued
+            if head == "wait" and warmup_norms.count("wait") >= 1:
+                rewards.append(-0.2)
+            else:
+                rewards.append(0.0)
             continue
-        rewards.append(-0.5 if this == last else 0.0)
+
+        if cmd_norm in warmup_norms:
+            rewards.append(-1.0)
+            continue
+
+        if len(parts) >= 2:
+            verb_target = (parts[0], parts[1])
+            hit = False
+            for w in warmup_norms:
+                wp = w.split()
+                if len(wp) >= 2 and (wp[0], wp[1]) == verb_target:
+                    hit = True
+                    break
+            rewards.append(-0.4 if hit else 0.0)
+        else:
+            rewards.append(0.0)
     return rewards
 
 
-# Public bundle
 ALL_REWARD_FNS = [format_reward_fn, env_reward_fn, command_quality_fn, no_repeat_fn]

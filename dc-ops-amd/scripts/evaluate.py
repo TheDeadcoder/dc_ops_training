@@ -1,6 +1,3 @@
-#!/usr/bin/env python
-# Copyright (c) 2026
-# SPDX-License-Identifier: BSD-3-Clause
 """
 Evaluation: Base model vs GRPO-trained model on hard DC-Ops scenarios.
 

@@ -1,5 +1,3 @@
-# Copyright (c) 2026
-# SPDX-License-Identifier: BSD-3-Clause
 """
 ROCm 7.2 / MI300X runtime environment setup.
 

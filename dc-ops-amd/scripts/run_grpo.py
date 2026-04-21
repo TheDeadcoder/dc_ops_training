@@ -75,9 +75,9 @@ def _fix_vllm_rocm_platform() -> None:
     Replace vLLM's current_platform singleton with _MI300XPlatform — a subclass
     of RocmPlatform that:
 
-      1. Overrides every known stub that raises NotImplementedError or returns
-         None where vLLM expects a real value (check_if_supports_dtype,
-         mem_get_info, get_punica_wrapper).
+        1. Overrides every known stub that raises NotImplementedError or returns
+            None where vLLM expects a real value (check_if_supports_dtype,
+            mem_get_info).
       2. Has a __getattribute__ safety-net: if ANY public method raises
          NotImplementedError at runtime, it is automatically retried on a
          CudaPlatform instance.  MI300X speaks CUDA-compat (HIP) natively,
@@ -90,10 +90,22 @@ def _fix_vllm_rocm_platform() -> None:
     """
     import importlib
     import torch as _torch
-    from vllm.lora.ops.triton_ops.lora_shrink_op import _lora_shrink as _triton_shrink
     try:
-        _torch.library.impl("vllm::lora_shrink", "CUDA")(_triton_shrink)
-    except RuntimeError:
+        from vllm.lora.ops.triton_ops.lora_expand_op import _lora_expand as _triton_expand
+        from vllm.lora.ops.triton_ops.lora_shrink_op import _lora_shrink as _triton_shrink
+
+        # The ROCm wheel registers these ops, but on this build the CUDA/HIP
+        # dispatch entry can be missing. Re-registering the Triton reference
+        # implementation restores the fast path without changing Punica.
+        for _op_name, _op_impl in (
+            ("vllm::lora_shrink", _triton_shrink),
+            ("vllm::lora_expand", _triton_expand),
+        ):
+            try:
+                _torch.library.impl(_op_name, "CUDA")(_op_impl)
+            except RuntimeError:
+                pass
+    except ImportError:
         pass
     import vllm.platforms as _vp
 
@@ -137,25 +149,8 @@ def _fix_vllm_rocm_platform() -> None:
             return _torch.cuda.mem_get_info(device)
 
         def get_punica_wrapper(self) -> str:
-            """punica_selector — base raises NotImplementedError.
-
-            PunicaWrapperGPU uses custom `vllm::lora_shrink` C++/CUDA ops
-            that are NOT compiled into the ROCm wheel.  On ROCm, vLLM ships
-            Triton kernels for LoRA ops instead.  Prefer PunicaWrapperTriton;
-            fall back to GPU wrapper only if the triton module is absent.
-            """
-            _triton_qualname = (
-                "vllm.lora.punica_wrapper.punica_triton.PunicaWrapperTriton"
-            )
-            _gpu_qualname = (
-                "vllm.lora.punica_wrapper.punica_gpu.PunicaWrapperGPU"
-            )
-            try:
-                import importlib as _il
-                _il.import_module("vllm.lora.punica_wrapper.punica_triton")
-                return _triton_qualname
-            except ImportError:
-                return _gpu_qualname
+            """ROCm v0.19.1 uses PunicaWrapperGPU; the op dispatch was the bug."""
+            return "vllm.lora.punica_wrapper.punica_gpu.PunicaWrapperGPU"
 
         # ---- safety-net for any future unimplemented stubs -----------
 
@@ -209,42 +204,7 @@ def _fix_vllm_rocm_platform() -> None:
     _dt = getattr(_new, "device_type", "?")
     print(f"[grpo] vLLM platform: _MI300XPlatform installed "
           f"(device_type='{_dt}', CUDA-fallback safety-net active)")
-
-    # ------------------------------------------------------------------
-    # Force PunicaWrapperTriton in punica_selector.
-    #
-    # Why: punica_selector.py selects PunicaWrapperGPU if it detects the
-    # C++ ops registered (they are — for CPU/Meta only, NOT HIP/CUDA).
-    # PunicaWrapperGPU then calls torch.ops.vllm.lora_shrink on the CUDA
-    # backend, which raises NotImplementedError at profile_run time.
-    #
-    # PunicaWrapperTriton uses Triton JIT kernels that compile natively
-    # on ROCm gfx942 and do not depend on the missing C++ op at all.
-    #
-    # We patch punica_selector.PunicaWrapper here (before LLM() is ever
-    # called) so vllm instantiates PunicaWrapperTriton from the start.
-    # ------------------------------------------------------------------
-    try:
-        import vllm.lora.punica_wrapper.punica_triton as _ptriton
-        import vllm.lora.punica_wrapper.punica_selector as _psel
-        _psel.PunicaWrapper = _ptriton.PunicaWrapperTriton
-        # Also patch any sibling modules that imported PunicaWrapper directly.
-        for _lmod in [
-            "vllm.lora.layers.column_parallel_linear",
-            "vllm.lora.layers.base_linear",
-            "vllm.lora.worker_manager",
-            "vllm.lora.models",
-        ]:
-            try:
-                _lm = importlib.import_module(_lmod)
-                if hasattr(_lm, "PunicaWrapper"):
-                    _lm.PunicaWrapper = _ptriton.PunicaWrapperTriton
-            except ImportError:
-                pass
-        print("[grpo] punica_selector.PunicaWrapper → PunicaWrapperTriton (ROCm override)")
-    except ImportError as _e:
-        print(f"[grpo] WARNING: could not redirect to PunicaWrapperTriton ({_e}); "
-              f"falling back to PunicaWrapperGPU + PyTorch BMM patch")
+    print("[grpo] vllm::lora_shrink and vllm::lora_expand CUDA dispatch repaired for ROCm")
 
 _fix_vllm_rocm_platform()
 del _fix_vllm_rocm_platform
@@ -252,19 +212,14 @@ del _fix_vllm_rocm_platform
 # ---------------------------------------------------------------------------
 # 2c) Patch punica LoRA ops for ROCm — safety-net only.
 # ---------------------------------------------------------------------------
-# Primary fix: _fix_vllm_rocm_platform() above already redirected
-# punica_selector.PunicaWrapper → PunicaWrapperTriton (Triton JIT kernels
-# that work on ROCm gfx942 without needing the C++ lora_shrink op).
+# Primary fix: _fix_vllm_rocm_platform() above repairs the missing ROCm/CUDA
+# dispatch entries for vllm::lora_shrink and vllm::lora_expand so the normal
+# Triton kernels can run through PunicaWrapperGPU at full speed.
 #
-# This block is a belt-and-suspenders fallback: if PunicaWrapperTriton was
-# unavailable (ImportError) AND punica_selector fell back to PunicaWrapperGPU,
-# we replace lora_shrink/lora_expand in punica_gpu's namespace with pure-
-# PyTorch BMM implementations so that the NotImplementedError from the
-# missing HIP backend is caught and handled gracefully.
-#
-# Confirmed: vllm::lora_shrink registers only CPU + Meta dispatch keys on
-# this build — no HIP/CUDA kernel is present (see NotImplementedError in
-# run log). PunicaWrapperGPU calling it would always fail on GPU.
+# This block is a belt-and-suspenders fallback: if the runtime still routes to
+# an unimplemented op variant, we replace lora_shrink/lora_expand in
+# punica_gpu's namespace with pure-PyTorch implementations that match the exact
+# v0.19.1 argument layout.
 def _patch_punica_lora_for_rocm() -> None:
     import torch as _torch
 
@@ -276,91 +231,96 @@ def _patch_punica_lora_for_rocm() -> None:
     _orig_shrink = getattr(_pg, "lora_shrink", None)
     _orig_expand = getattr(_pg, "lora_expand", None)
 
+    def _stacked(weights):
+        if isinstance(weights, (list, tuple)):
+            return tuple(weights)
+        return (weights,)
+
     def _pt_lora_shrink(*args, **kwargs):
         """
         Pure-PyTorch vllm::lora_shrink fallback for ROCm.
 
-        Handles two calling conventions without relying on hardcoded
-        positional indices (the layout changed across vllm builds):
+        Handles the exact v0.19.1 positional custom-op signature and the older
+        keyword-based convention used before it.
 
           old (vllm ≤ 0.18, keyword-only):
               (inputs, lora_a_stacked, *, indices, out, scale)
-          new (vllm 0.19.1+, positional, exact layout varies):
-              args contain: 2-D input tensor, 3-D lora weight tensor(s),
-              1-D integer index tensor, 2-D output tensor, float scale.
-              We recover these by type + shape inspection.
+          new (vllm 0.19.1+, positional):
+              (inputs, lora_a_weights, output_tensor, token_lora_mapping,
+               token_indices_sorted_by_lora_ids, num_tokens_per_lora,
+               lora_token_start_loc, lora_ids, no_lora_flag_cpu,
+               num_active_loras, scaling)
         """
         if "indices" in kwargs:
             # ---- old keyword-only convention (vllm ≤ 0.18) ----
             inputs         = args[0]
-            lora_a_stacked = args[1]
+            lora_a_stacked = _stacked(args[1])
             indices = kwargs["indices"]
             out     = kwargs["out"]
             scale   = float(kwargs.get("scale", kwargs.get("scaling", 1.0)))
-        else:
-            # ---- vllm 0.19.1+ positional: recover by type/shape ----
-            # Step 1: scaling scalar — first Python float OR 0/1-element tensor
-            scale = 1.0
-            for _a in args:
-                if isinstance(_a, float):
-                    scale = _a
-                    break
-                if isinstance(_a, _torch.Tensor) and _a.numel() == 1:
-                    scale = _a.item()
-                    break
+            out.zero_()
+            _flat_idx = indices.view(-1)
+            _valid = _torch.where(_flat_idx >= 0)[0]
+            if _valid.numel() == 0:
+                return
+            _idx = _flat_idx[_valid].long()
+            _inp = inputs.view(-1, inputs.shape[-1])[_valid]     # [V, H]
+            _out_flat = out.view(-1, out.shape[-1])               # [T, R_total]
+            _r_off = 0
+            for _la in lora_a_stacked:
+                _R = _la.shape[1]
+                _wa = _la[_idx]                                   # [V, R, H]
+                _contrib = _torch.bmm(
+                    _inp.unsqueeze(1),
+                    _wa.transpose(1, 2),
+                ).squeeze(1).mul_(scale)
+                _out_flat[_valid, _r_off:_r_off + _R].add_(
+                    _contrib.to(_out_flat.dtype)
+                )
+                _r_off += _R
+            return
 
-            # Step 2: classify tensors by rank
-            _td  = [_a for _a in args if isinstance(_a, _torch.Tensor)]
-            _nd1 = [_a for _a in _td if _a.ndim == 1]            # candidates: indices
-            _nd2 = [_a for _a in _td if _a.ndim == 2]            # candidates: inputs / out
-            _nd3p= [_a for _a in _td if _a.ndim >= 3]            # candidates: lora_a weights
+        if (
+            len(args) >= 11
+            and isinstance(args[0], _torch.Tensor)
+            and isinstance(args[2], _torch.Tensor)
+            and args[0].ndim == 2
+            and args[2].ndim == 3
+        ):
+            inputs = args[0]
+            lora_a_stacked = _stacked(args[1])
+            out = args[2]
+            token_lora_mapping = args[3]
+            no_lora_flag_cpu = args[8]
+            scale = float(args[10])
 
-            if not _nd3p or not _nd1 or not _nd2:
-                _shapes = [
-                    (f"T{list(_a.shape)}" if isinstance(_a, _torch.Tensor)
-                     else type(_a).__name__)
-                    for _a in args
-                ]
-                print(f"[grpo][ERROR] _pt_lora_shrink: cannot identify args. "
-                      f"Shapes: {_shapes}. Skipping lora contribution.")
+            out.zero_()
+            if no_lora_flag_cpu.numel() == 1 and bool(no_lora_flag_cpu.item()):
                 return
 
-            # lora weights: all 3-D+ tensors
-            lora_a_stacked = _nd3p
+            _flat_idx = token_lora_mapping[: inputs.size(0)].view(-1)
+            _valid = _torch.where(_flat_idx >= 0)[0]
+            if _valid.numel() == 0:
+                return
 
-            # indices: first 1-D integer tensor
-            indices = next(
-                (_a for _a in _nd1 if not _a.is_floating_point()),
-                _nd1[0],   # fallback to first 1-D tensor if all float
-            )
-
-            # inputs: 2-D tensor whose last dim matches lora hidden dim
-            _h = lora_a_stacked[0].shape[-1]
-            inputs = next((_a for _a in _nd2 if _a.shape[-1] == _h), _nd2[0])
-
-            # out: 2-D tensor whose last dim equals the total rank across loras
-            _r_total = sum(_la.shape[1] for _la in lora_a_stacked)
-            out = next(
-                (_a for _a in _nd2 if _a is not inputs and _a.shape[-1] == _r_total),
-                next((_a for _a in _nd2 if _a is not inputs), _nd2[0]),
-            )
-
-        # ---- shared implementation ----
-        _flat_idx = indices.view(-1)
-        _valid    = _torch.where(_flat_idx >= 0)[0]
-        if _valid.numel() == 0:
+            _idx = _flat_idx[_valid].long()
+            _inp = inputs.view(-1, inputs.shape[-1])[_valid]     # [V, H]
+            for _slice_idx, _la in enumerate(lora_a_stacked):
+                _wa = _la[_idx]                                   # [V, R, H]
+                _contrib = _torch.bmm(
+                    _inp.unsqueeze(1),
+                    _wa.transpose(1, 2),
+                ).squeeze(1).mul_(scale)
+                out[_slice_idx, _valid, :].add_(
+                    _contrib.to(out.dtype)
+                )
             return
-        _idx = _flat_idx[_valid].long()
-        _inp = inputs.view(-1, inputs.shape[-1])[_valid]     # [V, H]
-        _out_flat = out.view(-1, out.shape[-1])               # [T, R_total]
-        _r_off = 0
-        for _la in lora_a_stacked:
-            _R  = _la.shape[1]
-            _wa = _la[_idx]                                   # [V, R, H]
-            _out_flat[_valid, _r_off:_r_off + _R].add_(
-                _torch.bmm(_inp.unsqueeze(1), _wa).squeeze(1).mul_(scale)
-            )
-            _r_off += _R
+
+        _shapes = [
+            (f"T{list(_a.shape)}" if isinstance(_a, _torch.Tensor) else type(_a).__name__)
+            for _a in args
+        ]
+        print(f"[grpo][ERROR] _pt_lora_shrink: unsupported arg layout. Shapes: {_shapes}")
 
     def _pt_lora_expand(*args, **kwargs):
         """
@@ -369,79 +329,85 @@ def _patch_punica_lora_for_rocm() -> None:
         Same dual-convention handling as _pt_lora_shrink above.
           old: (inputs, lora_b_stacked, *, indices, out, scale,
                 offset_start=0, add_inputs=True, embed_indices=None)
-          new: positional, layout inferred by type/shape.
+          new: (inputs, lora_b_weights, output_tensor, token_lora_mapping,
+                token_indices_sorted_by_lora_ids, num_tokens_per_lora,
+                lora_token_start_loc, lora_ids, no_lora_flag_cpu,
+                num_active_loras, *, offset_start=0, add_inputs=False)
         """
         if "indices" in kwargs:
             # ---- old keyword-only convention (vllm ≤ 0.18) ----
             inputs         = args[0]
-            lora_b_stacked = args[1]
+            lora_b_stacked = _stacked(args[1])
             indices      = kwargs["indices"]
             out          = kwargs["out"]
             scale        = float(kwargs.get("scale", kwargs.get("scaling", 1.0)))
             offset_start = int(kwargs.get("offset_start", 0))
-        else:
-            # ---- vllm 0.19.1+ positional: recover by type/shape ----
-            scale = 1.0
-            for _a in args:
-                if isinstance(_a, float):
-                    scale = _a
-                    break
-                if isinstance(_a, _torch.Tensor) and _a.numel() == 1:
-                    scale = _a.item()
-                    break
+            add_inputs = bool(kwargs.get("add_inputs", True))
+            _out_flat = out.view(-1, out.shape[-1])
+            _o_total = sum(_lb.shape[1] for _lb in lora_b_stacked)
+            if not add_inputs:
+                _out_flat[:, offset_start:offset_start + _o_total].zero_()
+            _flat_idx = indices.view(-1)
+            _valid = _torch.where(_flat_idx >= 0)[0]
+            if _valid.numel() == 0:
+                return
+            _idx = _flat_idx[_valid].long()
+            _inp = inputs.view(-1, inputs.shape[-1])[_valid]       # [V, R]
+            _o_off = offset_start
+            for _lb in lora_b_stacked:
+                _O = _lb.shape[1]
+                _wb = _lb[_idx].to(_inp.dtype)                     # [V, O, R]
+                _contrib = _torch.bmm(_wb, _inp.unsqueeze(-1)).squeeze(-1).mul_(scale)
+                _out_flat[_valid, _o_off:_o_off + _O].add_(
+                    _contrib.to(_out_flat.dtype)
+                )
+                _o_off += _O
+            return
 
-            _td  = [_a for _a in args if isinstance(_a, _torch.Tensor)]
-            _nd1 = [_a for _a in _td if _a.ndim == 1]
-            _nd2 = [_a for _a in _td if _a.ndim == 2]
-            _nd3p= [_a for _a in _td if _a.ndim >= 3]
+        if (
+            len(args) >= 10
+            and isinstance(args[0], _torch.Tensor)
+            and isinstance(args[2], _torch.Tensor)
+            and args[0].ndim == 3
+            and args[2].ndim == 2
+        ):
+            inputs = args[0]
+            lora_b_stacked = _stacked(args[1])
+            out = args[2]
+            token_lora_mapping = args[3]
+            no_lora_flag_cpu = args[8]
+            offset_start = int(kwargs.get("offset_start", 0))
+            add_inputs = bool(kwargs.get("add_inputs", False))
 
-            if not _nd3p or not _nd1 or not _nd2:
-                _shapes = [
-                    (f"T{list(_a.shape)}" if isinstance(_a, _torch.Tensor)
-                     else type(_a).__name__)
-                    for _a in args
-                ]
-                print(f"[grpo][ERROR] _pt_lora_expand: cannot identify args. "
-                      f"Shapes: {_shapes}. Skipping lora contribution.")
+            _out_flat = out.view(-1, out.shape[-1])
+            _o_total = sum(_lb.shape[1] for _lb in lora_b_stacked)
+            if not add_inputs:
+                _out_flat[:, offset_start:offset_start + _o_total].zero_()
+            if no_lora_flag_cpu.numel() == 1 and bool(no_lora_flag_cpu.item()):
                 return
 
-            lora_b_stacked = _nd3p
+            _flat_idx = token_lora_mapping[: inputs.size(1)].view(-1)
+            _valid = _torch.where(_flat_idx >= 0)[0]
+            if _valid.numel() == 0:
+                return
 
-            indices = next(
-                (_a for _a in _nd1 if not _a.is_floating_point()),
-                _nd1[0],
-            )
-
-            # expand: inputs have shape [T, R] (rank), out has shape [T, O] (output)
-            _r = lora_b_stacked[0].shape[-1]   # lora_b shape: [L, O, R]
-            inputs = next((_a for _a in _nd2 if _a.shape[-1] == _r), _nd2[0])
-
-            _o_total = sum(_lb.shape[1] for _lb in lora_b_stacked)
-            out = next(
-                (_a for _a in _nd2 if _a is not inputs and _a.shape[-1] == _o_total),
-                next((_a for _a in _nd2 if _a is not inputs), _nd2[0]),
-            )
-
-            # offset_start: first int arg that isn't a likely batch/seq/token count
-            # (best-effort; defaults to 0 which is correct for most layers)
-            offset_start = 0
-
-        # ---- shared implementation ----
-        _flat_idx = indices.view(-1)
-        _valid    = _torch.where(_flat_idx >= 0)[0]
-        if _valid.numel() == 0:
+            _idx = _flat_idx[_valid].long()
+            _o_off = offset_start
+            for _slice_idx, _lb in enumerate(lora_b_stacked):
+                _inp = inputs[_slice_idx].view(-1, inputs.shape[-1])[_valid]  # [V, R]
+                _wb = _lb[_idx].to(_inp.dtype)                                 # [V, O, R]
+                _contrib = _torch.bmm(_wb, _inp.unsqueeze(-1)).squeeze(-1)
+                _out_flat[_valid, _o_off:_o_off + _lb.shape[1]].add_(
+                    _contrib.to(_out_flat.dtype)
+                )
+                _o_off += _lb.shape[1]
             return
-        _idx = _flat_idx[_valid].long()
-        _inp = inputs.view(-1, inputs.shape[-1])[_valid]       # [V, R]
-        _out_flat = out.view(-1, out.shape[-1])                 # [T, O_total]
-        _o_off = offset_start
-        for _lb in lora_b_stacked:
-            _O  = _lb.shape[1]
-            _wb = _lb[_idx]                                     # [V, O, R]
-            _out_flat[_valid, _o_off:_o_off + _O].add_(
-                _torch.bmm(_wb, _inp.unsqueeze(-1)).squeeze(-1).mul_(scale)
-            )
-            _o_off += _O
+
+        _shapes = [
+            (f"T{list(_a.shape)}" if isinstance(_a, _torch.Tensor) else type(_a).__name__)
+            for _a in args
+        ]
+        print(f"[grpo][ERROR] _pt_lora_expand: unsupported arg layout. Shapes: {_shapes}")
 
     def _safe_shrink(*args, **kwargs):
         # ---------------------------------------------------------------
@@ -452,8 +418,8 @@ def _patch_punica_lora_for_rocm() -> None:
         #   TypeError: takes 2 positional arguments but 11 were given
         # — BEFORE the try-block body ran, so the except never fired.
         # Using *args/**kwargs makes the wrapper transparent to any
-        # calling convention and lets the original C++ op (which IS
-        # compiled in this ROCm build) handle the call directly.
+        # calling convention and lets the registered op handle the fast path
+        # whenever the CUDA dispatch table is present.
         # ---------------------------------------------------------------
         try:
             _orig_shrink(*args, **kwargs)
@@ -585,24 +551,19 @@ def main() -> None:
         login(token=hf_token)
         print("[grpo] logged in to HuggingFace Hub")
 
-    # -------- Peft TP-sharding patch (notebook cell 40) ----------------
-    # Required when loading a LoRA into Unsloth's vLLM-fast-inference path —
-    # peft inspects torch.distributed.is_initialized() inside set_peft_model_state_dict
-    # and fights with vLLM's tensor-parallel init. We trick peft into thinking
-    # we're not in a distributed setting just for the duration of the load.
+    # -------- PEFT TP-load compatibility patch --------------------------
+    # PEFT 0.19.x added LoRA tensor-parallel checkpoint sharding that expects
+    # newer transformers TP internals than this stack provides
+    # (`transformers==4.54.1`). On this single-GPU ROCm/vLLM path we do not
+    # want PEFT to shard adapter checkpoints during load, so disable only that
+    # helper and leave the rest of adapter loading untouched.
     import peft.utils.save_and_load as _sal
-    _orig_set_peft = _sal.set_peft_model_state_dict
 
-    def _patched_set_peft(model, state_dict, adapter_name="default", **kwargs):
-        _orig_is_init = torch.distributed.is_initialized
-        torch.distributed.is_initialized = lambda: False
-        try:
-            return _orig_set_peft(model, state_dict, adapter_name=adapter_name, **kwargs)
-        finally:
-            torch.distributed.is_initialized = _orig_is_init
-
-    _sal.set_peft_model_state_dict = _patched_set_peft
-    print("[grpo] applied peft TP-sharding patch")
+    if hasattr(_sal, "_maybe_shard_state_dict_for_tp"):
+        _sal._maybe_shard_state_dict_for_tp = lambda *args, **kwargs: None
+        print("[grpo] disabled PEFT tensor-parallel adapter sharding for transformers 4.54.1")
+    else:
+        print("[grpo] PEFT tensor-parallel adapter sharding helper not present")
 
     # -------- Reload SFT model with vLLM fast-inference -----------------
     mcfg = cfg["model"]

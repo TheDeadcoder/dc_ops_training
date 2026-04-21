@@ -1,69 +1,20 @@
-# ============================================================================
-# DC-Ops SFT config — sized for AMD Instinct MI300X (192 GB VRAM)
-# ----------------------------------------------------------------------------
-# Every value below was computed from first principles for the MI300X, NOT
-# blindly copied from the notebook. Where I deviate from the notebook's
-# A100-80GB values, the comment explains why.
-#
-# DATASET REALITY (from full Qwen2.5-tokenizer EDA on train.jsonl):
-#   - 1083 raw episodes → 934 after VAR_* filter → 7107 windows
-#   - Each window contains: system prompt (~900 tok) + 1 prior turn pair
-#     (~600 tok user + ~150 tok assistant) + current turn pair (~600 tok
-#     user + ~150 tok assistant) ≈ 2300-2900 tokens TOTAL
-#   - Real per-window distribution: median ~2500 tok, p99 ~2700 tok, max ~2900 tok
-#   - This is MUCH larger than I initially estimated (I had wrongly excluded
-#     the system prompt from the per-window count). The system prompt is
-#     repeated in every window because chat-template puts it at every
-#     conversation start.
-#
-# WHY max_seq_length = 4096:
-#   - The largest window is ~2900 tokens. max_seq_length must be >= this
-#     to avoid truncating the trailing assistant turn (which is the
-#     supervised target — truncating it kills the training signal).
-#   - 2048 would truncate ~87% of windows. NEVER use 2048 for this dataset.
-#   - 3072 covers everything but leaves no room for packing.
-#   - 4096 covers the full distribution AND lets packing add an
-#     occasional small second window, modestly improving throughput.
-#   - 8192 is wasteful — windows don't pack densely beyond 4096.
-#
-# WHY per_device_train_batch_size = 20:
-#   Memory budget at seq=4096, bf16, FA2, no gradient checkpointing:
-#     Activations:       ~6.5 GB per batch unit (after FA2 + Unsloth savings)
-#     Base model 4-bit:  ~4 GB
-#     LoRA + grads:      ~0.2 GB
-#     AdamW states:      ~0.3 GB
-#     Workspace/frag:    ~8 GB
-#   At per_device=20: 130 + 5 + 8 = 143 GB peak (49 GB headroom on 192 GB)
-#   At per_device=24: 156 + 5 + 8 = 169 GB peak (23 GB headroom — risky)
-#   At per_device=16: 104 + 5 + 8 = 117 GB peak (75 GB unused — wasteful)
-#   per_device=20 is the sweet spot: 1.25x the notebook's 80GB-tier throughput
-#   (65K → 82K tokens/step) with comfortable headroom for any allocator
-#   fragmentation. If amd-smi shows >50 GB free during a stable run, you can
-#   bump to 24.
-#
-# WHY no gradient checkpointing:
-#   The notebook used use_gradient_checkpointing="unsloth" because A100-80GB
-#   needed the ~25% memory savings. We have 192 GB and 49 GB headroom — there
-#   is no memory pressure. Turning checkpointing OFF gives ~25-30% wall-clock
-#   speedup (no recomputation in backward pass).
-# ----------------------------------------------------------------------------
+# DC-Ops SFT config — AMD Instinct MI300X (192 GB VRAM)
 
 # ----- Data ------------------------------------------------------------------
 data:
-  hf_source: "Melikshah/dc-ops-sft-data"  # used when local_jsonl is null
-  local_jsonl: null                        # e.g. "./data/train.jsonl" for offline runs
-  eval_split: 0.05                         # ~ 355 eval windows
+  hf_source: "Melikshah/dc-ops-sft-data"
+  local_jsonl: null
+  eval_split: 0.05
   seed: 42
 
 # ----- Model -----------------------------------------------------------------
 model:
   name: "unsloth/Qwen2.5-7B-Instruct"
-  max_seq_length: 3072                     # see "WHY max_seq_length = 4096" above
-  load_in_4bit: true                       # 4-bit NF4 via ROCm bitsandbytes
+  max_seq_length: 3072
+  load_in_4bit: true
   dtype: "bfloat16"
 
 # ----- LoRA ------------------------------------------------------------------
-# All values match the notebook (cell 20).
 lora:
   r: 16
   alpha: 32
@@ -77,25 +28,25 @@ lora:
     - gate_proj
     - up_proj
     - down_proj
-  use_gradient_checkpointing: "unsloth"        # see "WHY no gradient checkpointing" above
+  use_gradient_checkpointing: "unsloth"
   random_state: 3407
 
 # ----- SFT training hyperparams ---------------------------------------------
 sft:
   output_dir: "./outputs/sft"
 
-  # Sized for MI300X, see header
   per_device_train_batch_size: 10
   gradient_accumulation_steps: 2
-  # → effective batch = 20
 
-  # All other optimizer values from notebook cell 24
-  num_train_epochs: 4
-  learning_rate: 1.0e-4
+  # 2 epochs: eval_loss bottoms at epoch ~1.33 then rises sharply.
+  # Running to epoch 4 causes progressive overfitting (2.696 → 2.827).
+  # GRPO provides further refinement, so early SFT stopping is correct.
+  num_train_epochs: 2
+  learning_rate: 7.0e-5                    # was 1e-4 — slightly lower for stability
   lr_scheduler_type: "cosine"
   warmup_steps: 10
   weight_decay: 0.01
-  max_grad_norm: 1.0                       # TRL default
+  max_grad_norm: 1.0
 
   bf16: true
   fp16: false
@@ -106,9 +57,9 @@ sft:
   save_strategy: "steps"
   save_steps: 50
   save_total_limit: 4
+  load_best_model_at_end: true             # saves best eval_loss checkpoint
+  metric_for_best_model: "eval_loss"
 
-  # 0 because TRL's HF datasets path is fast enough on its own (cell 24).
-  # Setting >0 with packing=True can cause subtle worker-pickling issues.
   dataloader_num_workers: 0
   dataloader_pin_memory: true
 
@@ -119,12 +70,9 @@ sft:
 
 # ----- Save / push -----------------------------------------------------------
 save:
-  local_dir: "./outputs/dc_ops_sft_lora"   # LoRA + tokenizer + system_prompt.txt land here
+  local_dir: "./outputs/dc_ops_sft_lora"
 
-# ----- Post-SFT verification (notebook cell 33) -----------------------------
-# Generate one A2 response and verify the output has <reasoning>+<command>.
-# Catches the catastrophic case where SFT ran but format collapsed — if
-# format is broken, GRPO learns nothing.
+# ----- Post-SFT verification -------------------------------------------------
 verify_after_train:
   enabled: true
   scenario: "A2"
@@ -133,7 +81,7 @@ verify_after_train:
   temperature: 0.7
   top_p: 0.9
 
-# ----- Weights & Biases -----------------------------------------------------
+# ----- Weights & Biases ------------------------------------------------------
 wandb:
   enabled: true
   project: "dc-ops-amd"

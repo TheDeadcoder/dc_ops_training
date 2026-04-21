@@ -48,15 +48,25 @@ in `setup_env.sh`.
 
 ```bash
 # 1) get the repos side-by-side
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y build-essential git wget curl vim tmux htop nvtop
+apt update && apt install -y cmake ninja-build
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
 git clone <this-repo>             dc-ops-amd
 git clone https://github.com/TheDeadcoder/dc_ops_environment.git
 
 cd dc-ops-amd
-
 # 2) install everything (~15 min on first run: bitsandbytes + flash-attn
 #    compile from source). Re-runnable.
 chmod +x setup_env.sh
+
+tmux new -s rocm-setup
+cd /root/dc_ops_training/dc-ops-amd   
+source .venv/bin/activate
 ./setup_env.sh
+Detach with Ctrl+B then D — the build continues in the background.
+Reattach later with tmux attach -t rocm-setup.
 
 # 3) secrets
 cp .env.example .env
@@ -64,6 +74,7 @@ $EDITOR .env       # set HUGGINGFACE_TOKEN and WANDB_API_KEY
 
 # 4) sanity-check
 source .venv/bin/activate
+cp -r ../dc_ops_environment/dc_ops_env/ .
 python scripts/verify_setup.py
 
 # 5) (optional) look at the data

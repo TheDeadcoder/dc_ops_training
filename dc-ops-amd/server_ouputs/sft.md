@@ -1,10 +1,68 @@
-### from wandb
-2026-04-21 11:52:58
-wandb: Detected [huggingface_hub.inference, mcp, openai] in use.
-2026-04-21 11:52:58
-wandb: Use W&B Weave for improved LLM call tracing. Install Weave with `pip install weave` then add `import weave` to the top of your script.
-2026-04-21 11:52:58
-wandb: For more information, check out the docs at: https://weave-docs.wandb.ai
+# SFT Training Run — 2026-04-21
+
+## Overview
+
+| Field | Value |
+|---|---|
+| Run date | 2026-04-21 |
+| Total epochs | 2 |
+| Train runtime | 3625 s (~60 min) |
+| Final train loss | 0.0447 |
+| Train samples/sec | 3.724 |
+| Train steps/sec | 0.186 |
+| Output | `./outputs/dc_ops_sft_lora` |
+
+---
+
+## Training Curves
+
+<table>
+  <tr>
+    <td align="center"><b>Evaluation Loss</b></td>
+    <td align="center"><b>Train Loss</b></td>
+  </tr>
+  <tr>
+    <td><img src="https://ik.imagekit.io/sakib61/SFT/Screenshot%202026-04-22%20at%2012.13.43%E2%80%AFAM.png" width="100%"/></td>
+    <td><img src="https://ik.imagekit.io/sakib61/SFT/Screenshot%202026-04-22%20at%2012.14.15%E2%80%AFAM.png" width="100%"/></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Learning Rate Schedule</b></td>
+    <td align="center"><b>Gradient Norm</b></td>
+  </tr>
+  <tr>
+    <td><img src="https://ik.imagekit.io/sakib61/SFT/Screenshot%202026-04-22%20at%2012.27.14%E2%80%AFAM.png" width="100%"/></td>
+    <td><img src="https://ik.imagekit.io/sakib61/SFT/Screenshot%202026-04-22%20at%2012.27.27%E2%80%AFAM.png" width="100%"/></td>
+  </tr>
+</table>
+
+---
+
+## Evaluation Loss by Epoch
+
+| Epoch | Eval Loss |
+|---|---|
+| 0.148 | 2.6525 |
+| 0.296 | 3.0476 |
+| 0.444 | 2.8638 |
+| 0.592 | 2.7365 |
+| 0.740 | 2.7699 |
+| 0.888 | 2.7239 |
+| 1.036 | 2.6966 |
+| 1.183 | 2.7288 |
+| 1.331 | 2.6965 |
+| 1.479 | 2.6977 |
+| 1.627 | 2.7998 |
+| 1.775 | 2.8211 |
+| 1.923 | 2.8272 |
+| 1.975 | 2.8272 |
+
+---
+
+## Raw Training Log
+
+**W&B environment:** `huggingface_hub.inference`, `mcp`, `openai`
+
+```
 2026-04-21 11:53:25
 {'loss': 1.1469, 'grad_norm': 0.5851776599884033, 'learning_rate': 8e-05, 'epoch': 0.014792899408284023}
 2026-04-21 11:53:48
@@ -307,37 +365,30 @@ wandb: For more information, check out the docs at: https://weave-docs.wandb.ai
 [sft] DONE. final training loss = 0.0447  runtime = 3625 s
 2026-04-21 12:53:25
 [sft] LoRA + tokenizer + system_prompt + run-meta saved → ./outputs/dc_ops_sft_lora
-2026-04-21 12:53:25
-[sft-verify] running post-train format check …
-2026-04-21 12:53:28
+```
+
+---
+
+## Post-Training Format Verification
+
+```
+[sft-verify] running post-train format check ...
 ============================================================
-2026-04-21 12:53:28
 [sft-verify] SFT MODEL FORMAT VERIFICATION
-2026-04-21 12:53:28
 ============================================================
-2026-04-21 12:53:28
 [sft-verify] Response (first 500 chars):
-2026-04-21 12:53:28
+
 <reasoning>
-2026-04-21 12:53:28
 1. Situation: CRAC-3 compressor failure detected, causing potential cooling issues in Zone B.
-2026-04-21 12:53:28
 2. Constraint: Operational procedure requires diagnosing faulty units before compensating.
-2026-04-21 12:53:28
-3. Step: Assess → diagnose.
-2026-04-21 12:53:28
+3. Step: Assess -> diagnose.
 4. Action: Diagnose CRAC-3 to understand the extent of the failure and determine next steps.
-2026-04-21 12:53:28
 </reasoning>
-2026-04-21 12:53:28
 <command>
-2026-04-21 12:53:28
 diagnose CRAC-3
-2026-04-21 12:53:28
 </command>
-2026-04-21 12:53:28
+
 [sft-verify] Has <reasoning>: True
-2026-04-21 12:53:28
 [sft-verify] Has <command>:   True
-2026-04-21 12:53:28
 [sft-verify] OK — format intact, ready for GRPO
+```

@@ -57,14 +57,6 @@ if command -v rocminfo >/dev/null 2>&1; then
   [[ "$GFX" == "gfx942" ]] || warn "Expected gfx942 for MI300X, got $GFX"
 fi
 
-# ---------- 1. uv ----------
-if ! command -v uv >/dev/null 2>&1; then
-  log "installing uv"
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  # shellcheck disable=SC1091
-  source "$HOME/.local/bin/env" 2>/dev/null || export PATH="$HOME/.local/bin:$PATH"
-fi
-ok "uv $(uv --version)"
 
 # ---------- 2. venv (Python 3.12) ----------
 if [[ ! -d .venv ]]; then
@@ -75,15 +67,15 @@ fi
 source .venv/bin/activate
 ok "venv active: $(which python) ($(python --version))"
 
-# always use --python from the venv for uv pip
-UV_PIP="uv pip install --python .venv/bin/python"
+VENV_PYTHON="$PWD/.venv/bin/python"
+UV_PIP="uv pip install --python ${VENV_PYTHON}"
 
 # ---------- 3. PyTorch + torchvision + torchaudio for ROCm ----------
 # torch 2.10.0 + rocm7.1 wheels run fine on ROCm 7.2 userspace (forward compat).
 # This is the set used by vLLM's ROCm 7.1 constraints file (triton 3.6, etc.).
 log "installing PyTorch 2.10.0 + rocm7.1 wheels"
-$UV_PIP install --upgrade pip wheel setuptools
-$UV_PIP install \
+$UV_PIP --upgrade pip wheel setuptools
+$UV_PIP \
   torch==2.10.0 \
   torchvision==0.25.0 \
   torchaudio==2.10.0 \
@@ -97,13 +89,9 @@ print(f"  torch {torch.__version__}  |  HIP {torch.version.hip}  |  device {torc
 PY
 ok "torch sees the GPU"
 
-# ---------- 4. Triton (matched to torch 2.10 / rocm7.1) ----------
-log "installing triton 3.6.0"
-$UV_PIP install --upgrade triton==3.6.0
-
 # ---------- 5. Core training libs (pinned from the notebook) ----------
 log "installing transformers / tokenizers / peft / accelerate / trl"
-$UV_PIP install \
+$UV_PIP \
   "transformers==4.54.1" \
   "tokenizers==0.21.0" \
   "peft>=0.13,<0.17" \
@@ -115,18 +103,16 @@ $UV_PIP install \
   "safetensors"
 
 # trl — pinned to a version known to work with transformers 4.54 + GRPO
-$UV_PIP install "trl==0.21.0"
+$UV_PIP "trl==0.21.0"
 
 # ---------- 6. xformers (ROCm-compatible build) ----------
 # xformers 0.0.34 pairs with torch 2.10 on ROCm 7.1 (per vLLM constraints).
 # We install it --no-build-isolation so it picks up the ROCm torch we already have.
 log "installing xformers 0.0.34 (ROCm build)"
 PYTORCH_ROCM_ARCH="gfx942" \
-  $UV_PIP install --no-build-isolation "xformers==0.0.34" || warn "xformers install failed — SDPA will fallback to PyTorch native. Training still works."
+  $UV_PIP --no-build-isolation "xformers==0.0.34" || warn "xformers install failed — SDPA will fallback to PyTorch native. Training still works."
 
 # ---------- 7. bitsandbytes — ROCm fork ----------
-# Needed for 4-bit QLoRA (load_in_4bit=True). The upstream bnb does not support
-# ROCm; we must build from the ROCm/bitsandbytes rocm_enabled_multi_backend branch.
 log "installing bitsandbytes (ROCm fork, built from source — ~2-4 min)"
 BNB_DIR="$PWD/.build/bitsandbytes"
 if [[ ! -d "$BNB_DIR" ]]; then
@@ -136,11 +122,35 @@ if [[ ! -d "$BNB_DIR" ]]; then
 fi
 (
   cd "$BNB_DIR"
-  $UV_PIP install -r requirements-dev.txt
-  # ROCm 7.2 uses amdclang; force gfx942
-  cmake -DCOMPUTE_BACKEND=hip -DBNB_ROCM_ARCH="gfx942" -S . -B build
+  $UV_PIP -r requirements-dev.txt
+
+  # Auto-detect ROCm root
+  if [[ -d /opt/rocm ]]; then
+    ROCM_ROOT=/opt/rocm
+  elif [[ -d /opt/rocm-7.2 ]]; then
+    ROCM_ROOT=/opt/rocm-7.2
+  else
+    ROCM_ROOT=/opt/rocm-7.2.0
+  fi
+  log "Using ROCm root for bitsandbytes: $ROCM_ROOT"
+
+  # Full ROCm + HIP CMake fix (required for ROCm 7.2)
+  export ROCM_PATH="$ROCM_ROOT"
+  export HIP_PATH="$ROCM_ROOT"
+  export PATH="$ROCM_ROOT/bin:$PATH"
+
+  ROCM_PATH="$ROCM_ROOT" \
+  CMAKE_HIP_COMPILER_ROCM_ROOT="$ROCM_ROOT" \
+    cmake -DCOMPUTE_BACKEND=hip \
+          -DBNB_ROCM_ARCH="gfx942" \
+          -DCMAKE_HIP_COMPILER_ROCM_ROOT="$ROCM_ROOT" \
+          -DCMAKE_PREFIX_PATH="$ROCM_ROOT" \
+          -DCMAKE_HIP_COMPILER="$ROCM_ROOT/bin/amdclang++" \
+          -S . -B build
+
   cmake --build build -j"$(nproc)"
-  $UV_PIP install -e .
+
+  $UV_PIP -e .
 )
 python - <<'PY' || err "bitsandbytes not usable"
 import bitsandbytes as bnb
@@ -158,12 +168,11 @@ if [[ ! -d "$FA_DIR" ]]; then
 fi
 (
   cd "$FA_DIR"
-  # pin to a tag known to build against torch 2.10 on ROCm 7.1/7.2
   git checkout main_perf 2>/dev/null || git checkout main
   GPU_ARCHS="gfx942" \
   MAX_JOBS="$(nproc)" \
   FLASH_ATTENTION_FORCE_BUILD="TRUE" \
-    $UV_PIP install . --no-build-isolation
+    $UV_PIP . --no-build-isolation
 )
 python - <<'PY' || warn "flash-attn import failed — transformers will fallback to SDPA (still fast on MI300X)"
 import flash_attn
@@ -175,14 +184,14 @@ ok "flash-attention installed"
 # vLLM on ROCm 7.2 is available as a prebuilt wheel at wheels.vllm.ai/rocm/.
 # We install --no-deps to stop it from yanking in a CPU-only torch from pypi.
 log "installing vllm (ROCm wheel, --no-deps)"
-$UV_PIP install --no-deps --upgrade \
+$UV_PIP --no-deps --upgrade \
   vllm \
   --extra-index-url https://wheels.vllm.ai/rocm/ || \
-$UV_PIP install --no-deps --upgrade \
+$UV_PIP --no-deps --upgrade \
   vllm \
   --extra-index-url https://download.pytorch.org/whl/rocm7.1
 # pull the few missing runtime bits (ray, openai, etc) — without torch override
-$UV_PIP install \
+$UV_PIP \
   ray \
   "openai>=1.0" \
   outlines \
@@ -202,39 +211,47 @@ PY
 # Official install per unsloth.ai/docs/get-started/install/amd.
 # unsloth_zoo must come BEFORE unsloth.
 log "installing unsloth_zoo + unsloth (AMD path)"
-$UV_PIP install unsloth_zoo
-$UV_PIP install --no-deps "unsloth==2026.4.4"
+$UV_PIP unsloth_zoo
+$UV_PIP --no-deps "unsloth==2026.4.4"
 
 # ---------- 11. OpenEnv + DC-Ops environment ----------
 log "installing OpenEnv core"
-$UV_PIP install --upgrade "openenv-core[core]>=0.2.1"
+$UV_PIP --upgrade "openenv-core[core]>=0.2.1"
 
 # dc_ops_env is installed from the sibling ../dc_ops_environment clone.
 # If the user hasn't cloned it yet, we do it here.
 DC_OPS_DIR="$PWD/../dc_ops_environment"
 if [[ ! -d "$DC_OPS_DIR" ]]; then
   log "cloning dc_ops_environment alongside this repo"
-  git clone https://github.com/TheDeadcoder/dc_ops_environment.git "$DC_OPS_DIR" || \
+  git clone https://github_pat_**@github.com/TheDeadcoder/dc_ops_environment.git "$DC_OPS_DIR" || \
     warn "couldn't clone dc_ops_environment — please copy it to $DC_OPS_DIR manually"
 fi
 if [[ -d "$DC_OPS_DIR/dc_ops_env" ]]; then
   log "installing dc_ops_env in editable mode"
-  $UV_PIP install -e "$DC_OPS_DIR/dc_ops_env"
+  $UV_PIP -e "$DC_OPS_DIR/dc_ops_env"
 fi
 
 # ---------- 12. Training-side utilities ----------
 log "installing wandb, pyyaml, etc."
-$UV_PIP install \
+$UV_PIP \
   wandb \
   pyyaml \
   python-dotenv \
   rich \
-  tqdm
+  tqdm \
+  pybase64 \
+  pyzmq \
+  gguf \
+  cbor2 \
+  xgrammar \
+  llguidance \
+  partial-json-parser \
+  openai-harmony
 
 # ---------- 13. Pin lock — re-assert the core versions in case some transitive
 #              dep (unsloth_zoo in particular) tried to bump them.
 log "re-pinning transformers / tokenizers / hf-hub to avoid transitive upgrades"
-$UV_PIP install --force-reinstall --no-deps \
+$UV_PIP --force-reinstall --no-deps \
   "transformers==4.54.1" \
   "tokenizers==0.21.0" \
   "huggingface-hub>=0.34.0,<1.0"

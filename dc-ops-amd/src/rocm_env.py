@@ -59,6 +59,7 @@ def apply_rocm_env() -> None:
 
     # --- vLLM on ROCm ---
     # ROCm doesn't support fork(); vLLM must use spawn.
+    _setdefault("VLLM_TARGET_DEVICE", "rocm")
     _setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     # Prefer the CK (Composable Kernel) flash-attn kernels over Triton on
     # MI300X — measurably faster for the head dims we use.

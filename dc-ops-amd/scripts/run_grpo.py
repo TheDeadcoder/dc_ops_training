@@ -56,8 +56,432 @@ from unsloth import FastLanguageModel, PatchFastRL  # noqa: E402
 PatchFastRL("GRPO", FastLanguageModel)
 
 # ---------------------------------------------------------------------------
-# 3) Standard library + everything else
+# 2b) vLLM ROCm platform fix — MUST run after unsloth import, before LLM().
 # ---------------------------------------------------------------------------
+# Root cause: vllm.platforms initialises its `current_platform` singleton the
+# instant vllm is first imported (which happens inside the unsloth import
+# above). On this ROCm build the HIP-compat resolver doesn't fire at that
+# moment, so the singleton lands on UnspecifiedPlatform (device_type="").
+#
+# Setting VLLM_TARGET_DEVICE=cuda in the environment doesn't help because
+# vLLM 0.19.1+rocm721 doesn't consult that env-var for platform selection.
+#
+# The fix: directly inject the correct platform object into every module that
+# has already captured it via `from vllm.platforms import current_platform`
+# (a Python `from X import y` creates a separate name binding — replacing the
+# module attribute alone never reaches those already-bound references).
+def _fix_vllm_rocm_platform() -> None:
+    """
+    Replace vLLM's current_platform singleton with _MI300XPlatform — a subclass
+    of RocmPlatform that:
+
+      1. Overrides every known stub that raises NotImplementedError or returns
+         None where vLLM expects a real value (check_if_supports_dtype,
+         mem_get_info, get_punica_wrapper).
+      2. Has a __getattribute__ safety-net: if ANY public method raises
+         NotImplementedError at runtime, it is automatically retried on a
+         CudaPlatform instance.  MI300X speaks CUDA-compat (HIP) natively,
+         so CudaPlatform methods are always correct fallbacks.  This prevents
+         future whack-a-mole iterations if more stubs surface later in the
+         vLLM init path.
+      3. Patches the new singleton into every module that captured
+         current_platform via `from vllm.platforms import current_platform`
+         (a Python name-binding, not a live reference to the module attribute).
+    """
+    import importlib
+    import torch as _torch
+    from vllm.lora.ops.triton_ops.lora_shrink_op import _lora_shrink as _triton_shrink
+    try:
+        _torch.library.impl("vllm::lora_shrink", "CUDA")(_triton_shrink)
+    except RuntimeError:
+        pass
+    import vllm.platforms as _vp
+
+    # ------------------------------------------------------------------
+    # Build the platform bases
+    # ------------------------------------------------------------------
+    try:
+        from vllm.platforms.rocm import RocmPlatform as _RocmBase
+    except ImportError:
+        from vllm.platforms.cuda import CudaPlatform as _RocmBase  # type: ignore[assignment]
+
+    try:
+        from vllm.platforms.cuda import CudaPlatform as _CudaBase
+        _cuda_fallback = _CudaBase()
+    except Exception:
+        _cuda_fallback = None
+
+    _SUPPORTED_DTYPES = {_torch.float16, _torch.bfloat16, _torch.float32}
+
+    # ------------------------------------------------------------------
+    # The patched platform class
+    # ------------------------------------------------------------------
+    class _MI300XPlatform(_RocmBase):
+        """
+        RocmPlatform with CUDA-compat shims for every unimplemented stub.
+        Safe to use as a drop-in current_platform on MI300X / gfx942.
+        """
+
+        # ---- explicitly known broken stubs ---------------------------
+
+        def check_if_supports_dtype(self, dtype: "_torch.dtype") -> None:
+            """gpu_worker.init_device() — base raises NotImplementedError."""
+            if dtype not in _SUPPORTED_DTYPES:
+                raise ValueError(
+                    f"MI300X (ROCm) does not support dtype {dtype}. "
+                    f"Supported: {_SUPPORTED_DTYPES}"
+                )
+
+        def mem_get_info(self, device: "_torch.device") -> "tuple[int, int]":
+            """mem_utils.MemorySnapshot — base returns None (not callable)."""
+            return _torch.cuda.mem_get_info(device)
+
+        def get_punica_wrapper(self) -> str:
+            """punica_selector — base raises NotImplementedError.
+
+            PunicaWrapperGPU uses custom `vllm::lora_shrink` C++/CUDA ops
+            that are NOT compiled into the ROCm wheel.  On ROCm, vLLM ships
+            Triton kernels for LoRA ops instead.  Prefer PunicaWrapperTriton;
+            fall back to GPU wrapper only if the triton module is absent.
+            """
+            _triton_qualname = (
+                "vllm.lora.punica_wrapper.punica_triton.PunicaWrapperTriton"
+            )
+            _gpu_qualname = (
+                "vllm.lora.punica_wrapper.punica_gpu.PunicaWrapperGPU"
+            )
+            try:
+                import importlib as _il
+                _il.import_module("vllm.lora.punica_wrapper.punica_triton")
+                return _triton_qualname
+            except ImportError:
+                return _gpu_qualname
+
+        # ---- safety-net for any future unimplemented stubs -----------
+
+        def __getattribute__(self, name: str):  # type: ignore[override]
+            attr = super().__getattribute__(name)
+            # Only intercept public, callable, non-dunder methods.
+            if name.startswith("_") or not callable(attr):
+                return attr
+
+            def _with_cuda_fallback(*args, **kwargs):
+                try:
+                    return attr(*args, **kwargs)
+                except NotImplementedError:
+                    if _cuda_fallback is not None:
+                        cuda_method = getattr(_cuda_fallback, name, None)
+                        if cuda_method is not None:
+                            return cuda_method(*args, **kwargs)
+                    raise  # propagate if CUDA fallback also can't help
+
+            return _with_cuda_fallback
+
+    # ------------------------------------------------------------------
+    # Install the singleton
+    # ------------------------------------------------------------------
+    _new = _MI300XPlatform()
+    _vp.current_platform = _new
+
+    # Patch every module that captured current_platform by name.
+    # `from vllm.platforms import current_platform` creates an independent
+    # name binding — updating the module attribute alone never reaches it.
+    _targets = [
+        "vllm.engine.arg_utils",
+        "vllm.v1.engine.llm_engine",
+        "vllm.v1.engine.async_llm",
+        "vllm.v1.executor.gpu_executor",
+        "vllm.v1.executor.abstract_executor",
+        "vllm.v1.worker.gpu_worker",                  # check_if_supports_dtype
+        "vllm.v1.worker.worker_base",
+        "vllm.utils.mem_utils",                       # mem_get_info (MemorySnapshot)
+        "vllm.lora.punica_wrapper.punica_selector",   # get_punica_wrapper
+        "vllm.config.device",
+    ]
+    for _mod_name in _targets:
+        try:
+            _mod = importlib.import_module(_mod_name)
+            if hasattr(_mod, "current_platform"):
+                setattr(_mod, "current_platform", _new)
+        except ImportError:
+            pass  # module doesn't exist in this vLLM build — skip silently
+
+    _dt = getattr(_new, "device_type", "?")
+    print(f"[grpo] vLLM platform: _MI300XPlatform installed "
+          f"(device_type='{_dt}', CUDA-fallback safety-net active)")
+
+    # ------------------------------------------------------------------
+    # Force PunicaWrapperTriton in punica_selector.
+    #
+    # Why: punica_selector.py selects PunicaWrapperGPU if it detects the
+    # C++ ops registered (they are — for CPU/Meta only, NOT HIP/CUDA).
+    # PunicaWrapperGPU then calls torch.ops.vllm.lora_shrink on the CUDA
+    # backend, which raises NotImplementedError at profile_run time.
+    #
+    # PunicaWrapperTriton uses Triton JIT kernels that compile natively
+    # on ROCm gfx942 and do not depend on the missing C++ op at all.
+    #
+    # We patch punica_selector.PunicaWrapper here (before LLM() is ever
+    # called) so vllm instantiates PunicaWrapperTriton from the start.
+    # ------------------------------------------------------------------
+    try:
+        import vllm.lora.punica_wrapper.punica_triton as _ptriton
+        import vllm.lora.punica_wrapper.punica_selector as _psel
+        _psel.PunicaWrapper = _ptriton.PunicaWrapperTriton
+        # Also patch any sibling modules that imported PunicaWrapper directly.
+        for _lmod in [
+            "vllm.lora.layers.column_parallel_linear",
+            "vllm.lora.layers.base_linear",
+            "vllm.lora.worker_manager",
+            "vllm.lora.models",
+        ]:
+            try:
+                _lm = importlib.import_module(_lmod)
+                if hasattr(_lm, "PunicaWrapper"):
+                    _lm.PunicaWrapper = _ptriton.PunicaWrapperTriton
+            except ImportError:
+                pass
+        print("[grpo] punica_selector.PunicaWrapper → PunicaWrapperTriton (ROCm override)")
+    except ImportError as _e:
+        print(f"[grpo] WARNING: could not redirect to PunicaWrapperTriton ({_e}); "
+              f"falling back to PunicaWrapperGPU + PyTorch BMM patch")
+
+_fix_vllm_rocm_platform()
+del _fix_vllm_rocm_platform
+
+# ---------------------------------------------------------------------------
+# 2c) Patch punica LoRA ops for ROCm — safety-net only.
+# ---------------------------------------------------------------------------
+# Primary fix: _fix_vllm_rocm_platform() above already redirected
+# punica_selector.PunicaWrapper → PunicaWrapperTriton (Triton JIT kernels
+# that work on ROCm gfx942 without needing the C++ lora_shrink op).
+#
+# This block is a belt-and-suspenders fallback: if PunicaWrapperTriton was
+# unavailable (ImportError) AND punica_selector fell back to PunicaWrapperGPU,
+# we replace lora_shrink/lora_expand in punica_gpu's namespace with pure-
+# PyTorch BMM implementations so that the NotImplementedError from the
+# missing HIP backend is caught and handled gracefully.
+#
+# Confirmed: vllm::lora_shrink registers only CPU + Meta dispatch keys on
+# this build — no HIP/CUDA kernel is present (see NotImplementedError in
+# run log). PunicaWrapperGPU calling it would always fail on GPU.
+def _patch_punica_lora_for_rocm() -> None:
+    import torch as _torch
+
+    try:
+        import vllm.lora.punica_wrapper.punica_gpu as _pg
+    except ImportError:
+        return  # not available in this build
+
+    _orig_shrink = getattr(_pg, "lora_shrink", None)
+    _orig_expand = getattr(_pg, "lora_expand", None)
+
+    def _pt_lora_shrink(*args, **kwargs):
+        """
+        Pure-PyTorch vllm::lora_shrink fallback for ROCm.
+
+        Handles two calling conventions without relying on hardcoded
+        positional indices (the layout changed across vllm builds):
+
+          old (vllm ≤ 0.18, keyword-only):
+              (inputs, lora_a_stacked, *, indices, out, scale)
+          new (vllm 0.19.1+, positional, exact layout varies):
+              args contain: 2-D input tensor, 3-D lora weight tensor(s),
+              1-D integer index tensor, 2-D output tensor, float scale.
+              We recover these by type + shape inspection.
+        """
+        if "indices" in kwargs:
+            # ---- old keyword-only convention (vllm ≤ 0.18) ----
+            inputs         = args[0]
+            lora_a_stacked = args[1]
+            indices = kwargs["indices"]
+            out     = kwargs["out"]
+            scale   = float(kwargs.get("scale", kwargs.get("scaling", 1.0)))
+        else:
+            # ---- vllm 0.19.1+ positional: recover by type/shape ----
+            # Step 1: scaling scalar — first Python float OR 0/1-element tensor
+            scale = 1.0
+            for _a in args:
+                if isinstance(_a, float):
+                    scale = _a
+                    break
+                if isinstance(_a, _torch.Tensor) and _a.numel() == 1:
+                    scale = _a.item()
+                    break
+
+            # Step 2: classify tensors by rank
+            _td  = [_a for _a in args if isinstance(_a, _torch.Tensor)]
+            _nd1 = [_a for _a in _td if _a.ndim == 1]            # candidates: indices
+            _nd2 = [_a for _a in _td if _a.ndim == 2]            # candidates: inputs / out
+            _nd3p= [_a for _a in _td if _a.ndim >= 3]            # candidates: lora_a weights
+
+            if not _nd3p or not _nd1 or not _nd2:
+                _shapes = [
+                    (f"T{list(_a.shape)}" if isinstance(_a, _torch.Tensor)
+                     else type(_a).__name__)
+                    for _a in args
+                ]
+                print(f"[grpo][ERROR] _pt_lora_shrink: cannot identify args. "
+                      f"Shapes: {_shapes}. Skipping lora contribution.")
+                return
+
+            # lora weights: all 3-D+ tensors
+            lora_a_stacked = _nd3p
+
+            # indices: first 1-D integer tensor
+            indices = next(
+                (_a for _a in _nd1 if not _a.is_floating_point()),
+                _nd1[0],   # fallback to first 1-D tensor if all float
+            )
+
+            # inputs: 2-D tensor whose last dim matches lora hidden dim
+            _h = lora_a_stacked[0].shape[-1]
+            inputs = next((_a for _a in _nd2 if _a.shape[-1] == _h), _nd2[0])
+
+            # out: 2-D tensor whose last dim equals the total rank across loras
+            _r_total = sum(_la.shape[1] for _la in lora_a_stacked)
+            out = next(
+                (_a for _a in _nd2 if _a is not inputs and _a.shape[-1] == _r_total),
+                next((_a for _a in _nd2 if _a is not inputs), _nd2[0]),
+            )
+
+        # ---- shared implementation ----
+        _flat_idx = indices.view(-1)
+        _valid    = _torch.where(_flat_idx >= 0)[0]
+        if _valid.numel() == 0:
+            return
+        _idx = _flat_idx[_valid].long()
+        _inp = inputs.view(-1, inputs.shape[-1])[_valid]     # [V, H]
+        _out_flat = out.view(-1, out.shape[-1])               # [T, R_total]
+        _r_off = 0
+        for _la in lora_a_stacked:
+            _R  = _la.shape[1]
+            _wa = _la[_idx]                                   # [V, R, H]
+            _out_flat[_valid, _r_off:_r_off + _R].add_(
+                _torch.bmm(_inp.unsqueeze(1), _wa).squeeze(1).mul_(scale)
+            )
+            _r_off += _R
+
+    def _pt_lora_expand(*args, **kwargs):
+        """
+        Pure-PyTorch vllm::lora_expand fallback for ROCm.
+
+        Same dual-convention handling as _pt_lora_shrink above.
+          old: (inputs, lora_b_stacked, *, indices, out, scale,
+                offset_start=0, add_inputs=True, embed_indices=None)
+          new: positional, layout inferred by type/shape.
+        """
+        if "indices" in kwargs:
+            # ---- old keyword-only convention (vllm ≤ 0.18) ----
+            inputs         = args[0]
+            lora_b_stacked = args[1]
+            indices      = kwargs["indices"]
+            out          = kwargs["out"]
+            scale        = float(kwargs.get("scale", kwargs.get("scaling", 1.0)))
+            offset_start = int(kwargs.get("offset_start", 0))
+        else:
+            # ---- vllm 0.19.1+ positional: recover by type/shape ----
+            scale = 1.0
+            for _a in args:
+                if isinstance(_a, float):
+                    scale = _a
+                    break
+                if isinstance(_a, _torch.Tensor) and _a.numel() == 1:
+                    scale = _a.item()
+                    break
+
+            _td  = [_a for _a in args if isinstance(_a, _torch.Tensor)]
+            _nd1 = [_a for _a in _td if _a.ndim == 1]
+            _nd2 = [_a for _a in _td if _a.ndim == 2]
+            _nd3p= [_a for _a in _td if _a.ndim >= 3]
+
+            if not _nd3p or not _nd1 or not _nd2:
+                _shapes = [
+                    (f"T{list(_a.shape)}" if isinstance(_a, _torch.Tensor)
+                     else type(_a).__name__)
+                    for _a in args
+                ]
+                print(f"[grpo][ERROR] _pt_lora_expand: cannot identify args. "
+                      f"Shapes: {_shapes}. Skipping lora contribution.")
+                return
+
+            lora_b_stacked = _nd3p
+
+            indices = next(
+                (_a for _a in _nd1 if not _a.is_floating_point()),
+                _nd1[0],
+            )
+
+            # expand: inputs have shape [T, R] (rank), out has shape [T, O] (output)
+            _r = lora_b_stacked[0].shape[-1]   # lora_b shape: [L, O, R]
+            inputs = next((_a for _a in _nd2 if _a.shape[-1] == _r), _nd2[0])
+
+            _o_total = sum(_lb.shape[1] for _lb in lora_b_stacked)
+            out = next(
+                (_a for _a in _nd2 if _a is not inputs and _a.shape[-1] == _o_total),
+                next((_a for _a in _nd2 if _a is not inputs), _nd2[0]),
+            )
+
+            # offset_start: first int arg that isn't a likely batch/seq/token count
+            # (best-effort; defaults to 0 which is correct for most layers)
+            offset_start = 0
+
+        # ---- shared implementation ----
+        _flat_idx = indices.view(-1)
+        _valid    = _torch.where(_flat_idx >= 0)[0]
+        if _valid.numel() == 0:
+            return
+        _idx = _flat_idx[_valid].long()
+        _inp = inputs.view(-1, inputs.shape[-1])[_valid]       # [V, R]
+        _out_flat = out.view(-1, out.shape[-1])                 # [T, O_total]
+        _o_off = offset_start
+        for _lb in lora_b_stacked:
+            _O  = _lb.shape[1]
+            _wb = _lb[_idx]                                     # [V, O, R]
+            _out_flat[_valid, _o_off:_o_off + _O].add_(
+                _torch.bmm(_wb, _inp.unsqueeze(-1)).squeeze(-1).mul_(scale)
+            )
+            _o_off += _O
+
+    def _safe_shrink(*args, **kwargs):
+        # ---------------------------------------------------------------
+        # BUG FIX (vllm 0.19.1+rocm721): the old fixed signature
+        #   (inputs, lora_a_stacked, *, indices, out, scale)
+        # only accepted 2 positional args.  vllm 0.19.1 calls lora_shrink
+        # with 11 positional args, so Python raised:
+        #   TypeError: takes 2 positional arguments but 11 were given
+        # — BEFORE the try-block body ran, so the except never fired.
+        # Using *args/**kwargs makes the wrapper transparent to any
+        # calling convention and lets the original C++ op (which IS
+        # compiled in this ROCm build) handle the call directly.
+        # ---------------------------------------------------------------
+        try:
+            _orig_shrink(*args, **kwargs)
+        except (NotImplementedError, RuntimeError):
+            _pt_lora_shrink(*args, **kwargs)
+
+    def _safe_expand(*args, **kwargs):
+        try:
+            _orig_expand(*args, **kwargs)
+        except (NotImplementedError, RuntimeError):
+            _pt_lora_expand(*args, **kwargs)
+
+    patched = []
+    if _orig_shrink is not None:
+        _pg.lora_shrink = _safe_shrink
+        patched.append("lora_shrink")
+    if _orig_expand is not None:
+        _pg.lora_expand = _safe_expand
+        patched.append("lora_expand")
+
+    if patched:
+        print(f"[grpo] punica_gpu ROCm patch: {patched} → pure-PyTorch BMM fallbacks")
+
+
+_patch_punica_lora_for_rocm()
+del _patch_punica_lora_for_rocm
+
+
 import argparse                            # noqa: E402
 import os                                  # noqa: E402
 from collections import Counter            # noqa: E402

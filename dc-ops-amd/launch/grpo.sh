@@ -41,7 +41,7 @@ source .venv/bin/activate
 echo "[grpo.sh] venv python: $(which python)"
 
 # ---------- sanity ----------
-if grep -Eq '^\s*enabled:\s*true' "$CONFIG" | head -1 >/dev/null; then
+if grep -Eq '^\s*enabled:\s*true' "$CONFIG"; then
   if [[ -z "${WANDB_API_KEY:-}" ]]; then
     echo "[grpo.sh] WARNING: wandb.enabled=true but WANDB_API_KEY is empty"
     echo "           training may error at init. Set it in .env."

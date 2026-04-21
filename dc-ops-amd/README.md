@@ -68,6 +68,13 @@ source .venv/bin/activate
 Detach with Ctrl+B then D — the build continues in the background.
 Reattach later with tmux attach -t rocm-setup.
 
+cd /root/dc_ops_training/dc-ops-amd/.build/bitsandbytes/bitsandbytes
+ln -sfv libbitsandbytes_rocm72.so libbitsandbytes_rocm71.so
+ls -l libbitsandbytes_rocm*.so
+Output be like this:
+libbitsandbytes_rocm72.so
+libbitsandbytes_rocm71.so -> libbitsandbytes_rocm72.so
+
 # 3) secrets
 cp .env.example .env
 $EDITOR .env       # set HUGGINGFACE_TOKEN and WANDB_API_KEY

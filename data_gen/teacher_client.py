@@ -9,11 +9,6 @@ Parses three blocks per response:
   - <reasoning>  REQUIRED: distilled ≤200-word summary
   - <command>    REQUIRED: single command line
 
-Rationale:
-  Both R1-Distill and Qwen3 emit <think> via their chat template. We let
-  the model think freely there, then we read the structured <reasoning>
-  block as the canonical training signal. <command> is what the env
-  parses for reward.
 """
 
 from __future__ import annotations

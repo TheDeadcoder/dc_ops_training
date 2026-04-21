@@ -28,10 +28,6 @@ diagnose CRAC-3
 | `<reasoning>` | Distilled, structured, no-self-correction summary — the canonical training signal | ≤200 words, hard cap 1500 chars | **required** |
 | `<command>` | The single action sent to the env | one line | **required** |
  
-**Why three blocks (and not just `<reasoning>` or just `<think>`):**
-- The teacher (R1-Distill) and the eventual student (Qwen3-8B) both emit `<think>` natively via their chat templates. Suppressing it fights pretraining and burns tokens on resistance.
-- A `<reasoning>` block constrained to 4 numbered steps gives the model a *structure to fill* rather than freeform — this is the key trick that stops R1 from leaking "wait, actually..." into the summary.
-- During SFT the student learns to think AND to summarize. During GRPO you can keep `<think>` enabled, or switch the student to `enable_thinking=False` for ~5x faster rollouts (the `<reasoning>+<command>` structure stays from SFT memory).
 ## Output
  
 ```
@@ -64,8 +60,6 @@ data_out/
 | `TEACHER_TEMPERATURE` | 0.6 | Per DeepSeek's recommended R1 distill setting |
  
 ## Why DeepSeek-R1-Distill-Qwen-32B as the teacher
- 
-- **Native `<think>` reasoning** — same format Qwen3-8B (your student) emits.
 - **Strong structured-output behavior** — reliably follows the "fill these 4 numbered points" template inside `<reasoning>`.
 - **Fits on one MI300X at bf16 with `max_model_len=24576`** while leaving headroom for ~30 concurrent rollouts.
 

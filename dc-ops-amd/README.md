@@ -95,10 +95,10 @@ tail -f logs/sft-*.log            # follow locally
 
 # 7) push SFT LoRA to HF (foreground, takes ~1 min — it's tiny)
 python scripts/push_to_hf.py \
-    --local-dir outputs/dc_ops_sft_lora \
-    --repo-id   your-username/dc-ops-sft-lora \
+    --local-dir outputs/dc_ops_grpo_final \
+    --repo-id   Melikshah/grpo-model-first \
     --private
-
+https://huggingface.co/Melikshah/grpo-model-first
 # 8) update configs/grpo.yaml → model.sft_model_hub to your-username/dc-ops-sft-lora
 #    (or keep `sft_model_local: ./outputs/dc_ops_sft_lora` if training on the
 #    same box — the script prefers local over Hub automatically.)

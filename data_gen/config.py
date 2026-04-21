@@ -15,14 +15,6 @@ Format choice — three blocks per agent turn:
   diagnose CRAC-3
   </command>
 
-Why three blocks:
-  - <think> lets the teacher (R1-Distill) and the student (Qwen3-8B with
-    enable_thinking=True) operate in their native format — no fighting
-    pretraining.
-  - <reasoning> is a clean, predictable summary that the student learns to
-    produce after thinking. It's what shows up in the operations log.
-  - <command> is what the env actually parses for reward.
-
 If GRPO rollouts feel slow at training time, you can later switch the
 student to enable_thinking=False at GRPO time — it will still produce
 <reasoning>+<command> from SFT memory, but skip <think>. ~5x faster

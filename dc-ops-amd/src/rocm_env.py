@@ -30,6 +30,8 @@ def apply_rocm_env() -> None:
     # We don't force to 0 because the user may want to pick a specific slot;
     # we only default if completely unset.
     _setdefault("HIP_VISIBLE_DEVICES", "0")
+    _setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    _setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True")
 
     # --- MI300X performance knobs (documented by AMD) ---
     # Fast kernel-arg path: eliminates a host-side copy, ~5-10% win on LLM training.

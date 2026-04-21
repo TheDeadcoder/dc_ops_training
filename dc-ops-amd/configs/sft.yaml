@@ -58,15 +58,15 @@ data:
 # ----- Model -----------------------------------------------------------------
 model:
   name: "unsloth/Qwen2.5-7B-Instruct"
-  max_seq_length: 4096                     # see "WHY max_seq_length = 4096" above
+  max_seq_length: 3072                     # see "WHY max_seq_length = 4096" above
   load_in_4bit: true                       # 4-bit NF4 via ROCm bitsandbytes
   dtype: "bfloat16"
 
 # ----- LoRA ------------------------------------------------------------------
 # All values match the notebook (cell 20).
 lora:
-  r: 64
-  alpha: 64
+  r: 16
+  alpha: 32
   dropout: 0.0
   bias: "none"
   target_modules:
@@ -77,7 +77,7 @@ lora:
     - gate_proj
     - up_proj
     - down_proj
-  use_gradient_checkpointing: false        # see "WHY no gradient checkpointing" above
+  use_gradient_checkpointing: "unsloth"        # see "WHY no gradient checkpointing" above
   random_state: 3407
 
 # ----- SFT training hyperparams ---------------------------------------------
@@ -85,13 +85,13 @@ sft:
   output_dir: "./outputs/sft"
 
   # Sized for MI300X, see header
-  per_device_train_batch_size: 24
-  gradient_accumulation_steps: 1
+  per_device_train_batch_size: 10
+  gradient_accumulation_steps: 2
   # → effective batch = 20
 
   # All other optimizer values from notebook cell 24
-  num_train_epochs: 3
-  learning_rate: 2.0e-4
+  num_train_epochs: 4
+  learning_rate: 1.0e-4
   lr_scheduler_type: "cosine"
   warmup_steps: 10
   weight_decay: 0.01
@@ -112,7 +112,7 @@ sft:
   dataloader_num_workers: 0
   dataloader_pin_memory: true
 
-  packing: true
+  packing: false
   dataset_text_field: "text"
 
   seed: 3407

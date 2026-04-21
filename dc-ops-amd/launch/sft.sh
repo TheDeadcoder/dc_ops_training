@@ -65,7 +65,7 @@ mkdir -p logs
 STAMP=$(date +%Y%m%d-%H%M%S)
 LOG="logs/sft-${STAMP}.log"
 PID_FILE="logs/sft.pid"
-
+export PYTORCH_ALLOC_CONF="expandable_segments:True"
 # stdbuf -oL makes output line-buffered so tail -f is responsive
 nohup stdbuf -oL -eL python -u scripts/run_sft.py --config "$CONFIG" \
     > "$LOG" 2>&1 &

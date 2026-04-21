@@ -69,14 +69,14 @@ model:
   # box that just pulls from HF.
   sft_model_hub: "Melikshah/dc-ops-sft-lora-new"
   sft_model_local: "./outputs/dc_ops_sft_lora"
-  max_seq_length: 4096                     # matches SFT (LoRA was trained at 4096)
+  max_seq_length: 3072                     # matches SFT (LoRA was trained at 4096)
   load_in_4bit: true
-  max_lora_rank: 64                        # MUST match SFT lora.r
+  max_lora_rank: 16                        # MUST match SFT lora.r
 
 # ----- vLLM fast-inference (Unsloth path) -----------------------------------
 vllm:
   enabled: true
-  gpu_memory_utilization: 0.75             # vLLM gets 144 GB; training gets 48 GB
+  gpu_memory_utilization: 0.65             # vLLM gets 144 GB; training gets 48 GB
   enforce_eager: true                      # CUDA graphs unstable on ROCm — keep disabled
   temperature: 0.8
   top_p: 0.95
@@ -95,6 +95,7 @@ grpo:
   # Optimizer step sizing — sized for MI300X 192 GB
   per_device_train_batch_size: 8           # vs notebook 4 — 2x larger (we have headroom)
   gradient_accumulation_steps: 2           # matches notebook
+  use_gradient_checkpointing: "unsloth"
   # → effective batch = 16 = 2 prompts × 8 generations per opt step
   # (notebook 80GB tier was 1 prompt × 8 generations — we get 2x the
   # gradient signal per step)

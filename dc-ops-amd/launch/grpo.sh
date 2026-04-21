@@ -61,7 +61,7 @@ mkdir -p logs
 STAMP=$(date +%Y%m%d-%H%M%S)
 LOG="logs/grpo-${STAMP}.log"
 PID_FILE="logs/grpo.pid"
-
+export PYTORCH_ALLOC_CONF="expandable_segments:True"
 nohup stdbuf -oL -eL python -u scripts/run_grpo.py --config "$CONFIG" \
     > "$LOG" 2>&1 &
 

@@ -1,17 +1,4 @@
-# Copyright (c) 2026
-# SPDX-License-Identifier: BSD-3-Clause
-"""
-GRPO prompt-dataset builder.
-
-For GRPO we need a dataset of *prompts* (not full trajectories). Each prompt
-is a dashboard observation — either:
-    (a) an initial reset state, or
-    (b) a mid-episode state produced by running a short warmup action list.
-
-Each record carries `scenario_id`, `seed`, and `warmup_actions`. The reward
-function uses these to re-create the *exact* env state the model saw before
-scoring the model's response.
-"""
+"""GRPO prompt-dataset builder."""
 
 from __future__ import annotations
 
@@ -28,17 +15,17 @@ def build_grpo_prompts(
     tokenizer,
     system_prompt: str,
     *,
-    num_initial: int = 60,
-    num_midgame: int = 20,
+    num_initial: int = 30,
+    num_midgame: int = 55,
     seed: int = 42,
 ) -> Dataset:
     """Build the GRPO prompt dataset.
 
-    Produces ~ (num_initial + num_midgame) × 6 scenarios = ~480 prompts
-    at default settings. Records carry `scenario_id`, `seed`, and
-    `warmup_actions` for reward-time replay.
+    Produces ~(num_initial + num_midgame) * 6 prompts. The default tilts
+    toward mid-game because initial prompts differ only by ~120 s of warmup
+    noise while mid-game prompts land the agent in substantively different
+    states driven by different warmup-action sequences.
     """
-    # Lazy-import the env so this module stays import-safe for format-only tests
     from dc_ops_env.server.dc_ops_env_environment import DcOpsEnvironment
     from dc_ops_env.models import DcOpsAction
 
@@ -47,7 +34,7 @@ def build_grpo_prompts(
     env = DcOpsEnvironment()
 
     for scenario_id in SCENARIOS:
-        # ---- (a) Initial-state prompts ----
+        # ---- (a) Initial-state prompts -------------------------------------
         for i in range(num_initial):
             s = 1000 + i * 7
             try:
@@ -63,9 +50,11 @@ def build_grpo_prompts(
             except Exception as e:
                 print(f"  [warn] initial prompt failed for {scenario_id} seed={s}: {e}")
 
-        # ---- (b) Mid-game prompts (warmup pre-rolled) ----
+        # ---- (b) Mid-game prompts (warmup pre-rolled) ----------------------
         warmups = SCENARIO_WARMUP_ACTIONS.get(scenario_id, [[]])
         for j in range(num_midgame):
+            # Cycle through warmups AND vary the seed so each (warmup, seed)
+            # combination lands in a distinct slice of state space.
             s = 5000 + j * 13
             warmup = warmups[j % len(warmups)]
             try:

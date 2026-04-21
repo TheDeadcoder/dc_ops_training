@@ -1,6 +1,3 @@
-#!/usr/bin/env python
-# Copyright (c) 2026
-# SPDX-License-Identifier: BSD-3-Clause
 """
 EDA on the DC-Ops SFT dataset. Prints:
   - episode / window counts per scenario (after VAR_* filtering)

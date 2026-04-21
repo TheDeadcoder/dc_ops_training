@@ -1,123 +1,61 @@
 # ============================================================================
 # DC-Ops GRPO config — sized for AMD Instinct MI300X (192 GB VRAM)
 # ----------------------------------------------------------------------------
-# Every value below was computed from first principles for the MI300X, NOT
-# blindly copied from the notebook. Where I deviate from the notebook's
-# A100-80GB values, the comment explains why.
-#
-# DATASET REALITY (from full Qwen2.5-tokenizer EDA on train.jsonl):
-#   - GRPO prompts are: system_prompt (~900 tok) + dashboard observation
-#     (~600 tok) ≈ 1500 tokens total per prompt.
-#   - The notebook's max_prompt_length=1536 is JUST barely enough — leaves
-#     no room if the dashboard text varies. We use 2048 for safety margin.
-#   - Empirical p99 completion length in the notebook was ~150 tokens (the
-#     student emits ~120 tok of <reasoning> + 1-line <command>). The
-#     notebook used max_completion_length=384. We use 512 for a small
-#     safety bump in case the student gets verbose during training drift.
-#
-# WHY max_seq_length = 4096:
-#   - GRPO needs context = max_prompt_length + max_completion_length =
-#     2048 + 512 = 2560. So min sane max_seq_length = 2560.
-#   - 4096 matches SFT (no model-context mismatch when loading the LoRA).
-#   - Higher values waste vLLM KV cache memory.
-#
-# WHY per_device_train_batch_size = 8 + grad_accum = 2 (eff_batch = 16):
-#   With gpu_memory_utilization=0.75, vLLM grabs 144 GB up-front for KV cache.
-#   Training side has ~48 GB available. Per-batch training memory at
-#   prompt=2048 + completion=512 = 2560 seq:
-#     Activations:       ~4 GB per batch unit
-#     Base model 4-bit:  ~4 GB
-#     LoRA + grads:      ~0.2 GB
-#     AdamW states:      ~0.3 GB
-#   At per_device=8: 32 + 5 = 37 GB / 48 GB available ✓
-#   At per_device=16: 64 + 5 = 69 GB — exceeds 48 GB available ✗
-#   per_device=8 + grad_accum=2 → effective batch = 16 = 2 prompts × 8 gens
-#   per opt step. The notebook's per_device=4 + grad_accum=2 was 1 prompt
-#   per step — WE GET 2 PROMPTS, which means more diverse advantage
-#   estimates per gradient update (cleaner signal, since GRPO advantages
-#   are computed within-prompt-group).
-#
-# WHY gpu_memory_utilization = 0.75:
-#   With Qwen2.5-7B in vLLM at bf16 (~14 GB weights), vLLM at 0.75 of
-#   192 GB = 144 GB total → ~130 GB available for KV cache. At seq=2560
-#   that's ~600 concurrent generations. We need num_generations=8, so we
-#   could lower this to free more for training, BUT the bigger KV cache
-#   = bigger vLLM batches inside the rollout = faster rollouts. Rollout
-#   is the GRPO bottleneck, not the optimizer step.
-#
-# TRL constraint check:
-#   per_device_train_batch_size(8) × gradient_accumulation_steps(2) % num_generations(8) == 0
-#   → 16 % 8 == 0 ✓
-#
-# If you OOM at GRPO init, first try lowering gpu_memory_utilization
-# from 0.75 → 0.65 (each 0.05 = ~10 GB freed for training).
-# ----------------------------------------------------------------------------
 
 # ----- Data ------------------------------------------------------------------
 data:
-  num_initial_prompts: 60                  # per scenario (× 6 = 360)
-  num_midgame_prompts: 20                  # per scenario (× 6 = ~120)
+  num_initial_prompts: 30                  
+  num_midgame_prompts: 55                  
   seed: 42
   hf_source: "Melikshah/dc-ops-sft-data"
   local_jsonl: null
 
 # ----- Model (loaded from the SFT LoRA checkpoint) --------------------------
 model:
-  # Local-first resolution: if `sft_model_local` exists on disk, GRPO uses it.
-  # Otherwise it falls back to `sft_model_hub`. This makes the script
-  # standalone — same script works on the SFT machine AND on a fresh GPU
-  # box that just pulls from HF.
   sft_model_hub: "Melikshah/dc-ops-sft-lora-new"
   sft_model_local: "./outputs/dc_ops_sft_lora"
-  max_seq_length: 3072                     # matches SFT (LoRA was trained at 4096)
+  max_seq_length: 3072
   load_in_4bit: true
-  max_lora_rank: 16                        # MUST match SFT lora.r
+  max_lora_rank: 16
 
 # ----- vLLM fast-inference (Unsloth path) -----------------------------------
 vllm:
   enabled: true
-  gpu_memory_utilization: 0.65             # vLLM gets 144 GB; training gets 48 GB
-  enforce_eager: true                      # CUDA graphs unstable on ROCm — keep disabled
-  temperature: 0.8
-  top_p: 0.95
+  gpu_memory_utilization: 0.65
+  enforce_eager: true
+  temperature: 0.9                       
+  top_p: 0.9                               
 
-# ----- GRPO training hyperparams (SIZED FOR MI300X 192 GB) ------------------
+# ----- GRPO training hyperparams --------------------------------------------
 grpo:
   output_dir: "./outputs/grpo"
 
   # Group / rollout sizing
-  num_generations: 8                       # group size — matches notebook (good GRPO default)
-  max_prompt_length: 2048                  # vs notebook 1536 — our prompts are ~1500 tok
-                                           # (system + dashboard); 1536 leaves no margin
-  max_completion_length: 512               # vs notebook 384 — small bump for safety;
-                                           # student typically emits ~150 tok
+  num_generations: 8
+  max_prompt_length: 2048
+  max_completion_length: 512
 
-  # Optimizer step sizing — sized for MI300X 192 GB
-  per_device_train_batch_size: 8           # vs notebook 4 — 2x larger (we have headroom)
-  gradient_accumulation_steps: 2           # matches notebook
+  # Optimizer step sizing
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 2
   use_gradient_checkpointing: "unsloth"
-  # → effective batch = 16 = 2 prompts × 8 generations per opt step
-  # (notebook 80GB tier was 1 prompt × 8 generations — we get 2x the
-  # gradient signal per step)
 
-  # All training hyperparams below match the notebook (cell 42) — these
-  # are GRPO-stability values that don't need re-tuning per GPU.
-  num_train_epochs: 4
-  learning_rate: 5.0e-6                    # GRPO is sensitive — keep small
+  num_train_epochs: 7                     
+  learning_rate: 5.0e-6
   lr_scheduler_type: "cosine"
   warmup_ratio: 0.1
-  beta: 0.04                               # KL-to-reference penalty
-  max_grad_norm: 0.1                       # tight clipping for GRPO stability
+  beta: 0.05                               
+  max_grad_norm: 0.1
 
   bf16: true
   fp16: false
 
-  logging_steps: 1                         # log every step — GRPO datasets are small
+  logging_steps: 1
   save_strategy: "steps"
   save_steps: 50
   save_total_limit: 3
 
-  dataloader_num_workers: 0                # vLLM + workers = fork hell on ROCm
+  dataloader_num_workers: 0
   seed: 3407
 
 # ----- Save ------------------------------------------------------------------

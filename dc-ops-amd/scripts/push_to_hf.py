@@ -1,6 +1,4 @@
-#!/usr/bin/env python
-# Copyright (c) 2026
-# SPDX-License-Identifier: BSD-3-Clause
+
 """
 Push a trained SFT LoRA adapter to the HuggingFace Hub.
 
@@ -12,9 +10,11 @@ This is a separate step so you can:
 Usage:
     export HUGGINGFACE_TOKEN=hf_...
     python scripts/push_to_hf.py \\
-        --local-dir  outputs/dc_ops_sft_lora \\
-        --repo-id    your-username/dc-ops-sft-lora \\
-        [--private]  [--commit-message "..."]
+        --local-dir  outputs/dc_ops_grpo_final \\
+        --repo-id    Melikshah/dc_ops_grpo_lora \\
+       
+    
+    
 """
 
 from __future__ import annotations

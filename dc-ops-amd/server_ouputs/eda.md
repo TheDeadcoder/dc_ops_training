@@ -1,42 +1,73 @@
-(.venv) root@7:~/dc_ops_training/dc-ops-amd# python scripts/eda.py 
-/usr/lib/python3.12/importlib/__init__.py:90: UserWarning: A NumPy version >=1.23.5 and <2.3.0 is required for this version of SciPy (detected version 2.4.4)
-  return _bootstrap._gcd_import(name[level:], package, level)
+# DC-Ops SFT Dataset — EDA
 
-═══════ DC-Ops SFT dataset EDA ═══════
-source: HF Melikshah/dc-ops-sft-data
-raw episodes:          1,083
-dropped VAR_* rows:    149  (13.8%)
-kept episodes:         934
-    A1:  145  (15.5%)
-    A2:  225  (24.1%)
-    A4:  181  (19.4%)
-    B1:  120  (12.8%)
-    B3:  160  (17.1%)
-    B4:  103  (11.0%)
+**Source:** `Melikshah/dc-ops-sft-data` (HuggingFace)
 
-command frequency (GPT turns, kept episodes):
-      3658  set_rack_load  (51.5%)
-      1128  diagnose  (15.9%)
-       853  check_status  (12.0%)
-       650  adjust_setpoint  (9.1%)
-       249  start_generator  (3.5%)
-       197  wait  (2.8%)
-       137  set_fan_speed  (1.9%)
-       136  acknowledge_alarm  (1.9%)
-        52  start_crac  (0.7%)
-        25  set_ups_mode  (0.4%)
-        14  stop_crac  (0.2%)
-         8  stop_generator  (0.1%)
+---
 
-length stats (chars — rough token ≈ chars/4):
-   full GPT turn        n= 7107  mean=2977.8  median= 2893  p95= 4409  p99= 4509  max=4771
-   <think> block        n= 7107  mean=2541.3  median= 2463  p95= 3965  p99= 3995  max=4002
-   <reasoning> block    n= 7107  mean= 356.6  median=  351  p95=  467  p99=  546  max=812
-   <command> block      n= 7107  mean=  18.9  median=   20  p95=   25  p99=   27  max=36
+## Episode Summary
 
-→ max_seq_length recommendation (windowed prompts):
-   window p99 (upper-bound estimate) ≈ 2584 tokens
-   empirical p99 (tokenizer-measured): ~2700 tokens
-   empirical max (tokenizer-measured): ~2900 tokens
-   configs/sft.yaml sets max_seq_length=4096 → safe (covers max + packing headroom)
-   ⚠  NEVER drop max_seq_length below 3072 — would truncate >0% of windows
+| Metric | Count | Share |
+|---|---|---|
+| Raw episodes | 1,083 | — |
+| Dropped (`VAR_*` rows) | 149 | 13.8% |
+| Kept episodes | 934 | 86.2% |
+
+### Episode Split by Scenario
+
+| Scenario | Count | Share |
+|---|---|---|
+| A1 | 145 | 15.5% |
+| A2 | 225 | 24.1% |
+| A4 | 181 | 19.4% |
+| B1 | 120 | 12.8% |
+| B3 | 160 | 17.1% |
+| B4 | 103 | 11.0% |
+
+---
+
+## Command Frequency
+
+Counts across all GPT turns in kept episodes (n = 7,107 turns).
+
+| Command | Count | Share |
+|---|---|---|
+| `set_rack_load` | 3,658 | 51.5% |
+| `diagnose` | 1,128 | 15.9% |
+| `check_status` | 853 | 12.0% |
+| `adjust_setpoint` | 650 | 9.1% |
+| `start_generator` | 249 | 3.5% |
+| `wait` | 197 | 2.8% |
+| `set_fan_speed` | 137 | 1.9% |
+| `acknowledge_alarm` | 136 | 1.9% |
+| `start_crac` | 52 | 0.7% |
+| `set_ups_mode` | 25 | 0.4% |
+| `stop_crac` | 14 | 0.2% |
+| `stop_generator` | 8 | 0.1% |
+
+---
+
+## Length Statistics
+
+All measurements in characters. Rough token estimate: `chars / 4`.
+
+| Field | n | Mean | Median | p95 | p99 | Max |
+|---|---|---|---|---|---|---|
+| Full GPT turn | 7,107 | 2,977.8 | 2,893 | 4,409 | 4,509 | 4,771 |
+| `<think>` block | 7,107 | 2,541.3 | 2,463 | 3,965 | 3,995 | 4,002 |
+| `<reasoning>` block | 7,107 | 356.6 | 351 | 467 | 546 | 812 |
+| `<command>` block | 7,107 | 18.9 | 20 | 25 | 27 | 36 |
+
+---
+
+## `max_seq_length` Recommendation
+
+| Estimate | Tokens |
+|---|---|
+| Window p99 (upper-bound) | ~2,584 |
+| Empirical p99 (tokenizer-measured) | ~2,700 |
+| Empirical max (tokenizer-measured) | ~2,900 |
+| `configs/sft.yaml` setting | **4,096** |
+
+`configs/sft.yaml` sets `max_seq_length=4096` — safe, covers the empirical max with packing headroom.
+
+> **Warning:** Do not drop `max_seq_length` below **3,072**. Values below this threshold would truncate more than 0% of windows.

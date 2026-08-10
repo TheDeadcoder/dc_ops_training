@@ -7,13 +7,29 @@ from typing import Any
 
 from .constants import (
     BAD_FIRST_ACTIONS,
-    CRASH_KEYWORDS,
     GOOD_FIRST_ACTIONS,
     KNOWN_COMMANDS,
     OPTIMAL_FIRST_ACTIONS,
     POST_DIAGNOSIS_ACTIONS,
-    RESOLVE_KEYWORDS,
 )
+
+
+def _resolved(obs) -> bool:
+    """True iff the simulator itself reports the incident resolved."""
+    return bool(getattr(obs, "resolved", False))
+
+
+def _crashed(obs) -> bool:
+    """True iff the episode terminated in a genuine failure, as opposed to a
+    plain timeout. A crash ends the episode (``done``) without resolution and
+    with budget still on the clock; a timeout ends with ``steps_remaining == 0``.
+    Reads the simulator's own signals — no alert-text keyword matching.
+    """
+    return bool(
+        getattr(obs, "done", False)
+        and not getattr(obs, "resolved", False)
+        and getattr(obs, "steps_remaining", 0) > 0
+    )
 
 _CMD_RE       = re.compile(r"<command>\s*(.+?)\s*</command>",       re.DOTALL)
 _REASONING_RE = re.compile(r"<reasoning>\s*(.+?)\s*</reasoning>",   re.DOTALL)
@@ -243,9 +259,8 @@ def env_reward_fn(
             r_now = float(obs.reward)
             proxy_after = _proxy_health(env)
 
-            alert_l = (obs.alert or "").lower()
-            resolved = obs.done and any(k in alert_l for k in RESOLVE_KEYWORDS)
-            crashed  = obs.done and any(k in alert_l for k in CRASH_KEYWORDS)
+            resolved = _resolved(obs)
+            crashed  = _crashed(obs)
 
             best_proxy = proxy_after
             for _ in range(4):
@@ -255,11 +270,10 @@ def env_reward_fn(
                 p = _proxy_health(env)
                 if p > best_proxy:
                     best_proxy = p
-                alert_l = (obs.alert or "").lower()
                 if obs.done:
-                    if any(k in alert_l for k in RESOLVE_KEYWORDS):
+                    if _resolved(obs):
                         resolved = True
-                    elif any(k in alert_l for k in CRASH_KEYWORDS):
+                    elif _crashed(obs):
                         crashed = True
 
             delta_immediate = proxy_after - proxy_before

@@ -21,10 +21,21 @@ def build_grpo_prompts(
 ) -> Dataset:
     """Build the GRPO prompt dataset.
 
-    Produces ~(num_initial + num_midgame) * 6 prompts. The default tilts
-    toward mid-game because initial prompts differ only by ~120 s of warmup
-    noise while mid-game prompts land the agent in substantively different
-    states driven by different warmup-action sequences.
+    Produces ~(num_initial + num_midgame) * 6 prompts.
+
+    Each prompt is generated with a distinct seed. The environment now seeds
+    initial conditions in reset() (env issue 1.1), so distinct seeds produce
+    genuinely distinct starting states — jittered zone/outside temperatures,
+    UPS charge, per-rack IT load, and fault timing — rather than the identical
+    screens the old seedless env produced. Initial-state prompts therefore vary
+    by initial-condition jitter; mid-game prompts additionally vary by which
+    warmup-action sequence was pre-rolled, landing the agent in different
+    slices of state space.
+
+    Seeds here (initial: 1000 + i*7 -> 1000..1203; mid-game: 5000 + j*13 ->
+    5000..5702) are kept disjoint from the evaluation seed range (evaluate.py
+    defaults to --seed-base 1_000_000) so that GRPO never trains on an episode
+    the evaluation later scores.
     """
     from dc_ops_env.server.dc_ops_env_environment import DcOpsEnvironment
     from dc_ops_env.models import DcOpsAction

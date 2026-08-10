@@ -128,5 +128,10 @@ SCENARIO_EXPERT_FOLLOWUPS: dict[str, list[str]] = {
            "set_rack_load A-01 3", "set_rack_load B-01 3", "wait", "wait"],
 }
 
-RESOLVE_KEYWORDS = ("stabilized", "resolved", "optimized", "properly", "successfully")
-CRASH_KEYWORDS   = ("critical", "exhausted", "emergency", "unprotected")
+# NOTE: RESOLVE_KEYWORDS / CRASH_KEYWORDS were removed (review issue 1.3).
+# Episode outcome must be read from the simulator's own signal —
+# DcOpsObservation.resolved (and .steps_remaining to tell a real terminal
+# failure from a plain timeout) — never inferred by string-matching the alert.
+# "CRITICAL" is the literal first word of A4/B4's *opening* alert, so keyword
+# matching mislabelled a live-alarm termination as a crash and could not
+# distinguish a timeout from a genuine failure.

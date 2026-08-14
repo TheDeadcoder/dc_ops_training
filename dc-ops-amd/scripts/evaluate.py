@@ -16,13 +16,22 @@ For each model × scenario × seed, the script:
   3. Records per-step env rewards (physics simulator), total episode reward,
      resolution flag, and steps-to-resolution.
 
+The episode outcome (resolved / crashed / timed out) is read from the
+simulator's own signal — DcOpsObservation.resolved plus steps_remaining — not
+by string-matching the alert text. Alongside the environment reward (the trained
+objective), it reports an independent physics-outcome scorecard the model was
+never rewarded for (src/scorecard.py), with bootstrap 95% CIs and a paired
+base-vs-GRPO test on matched seeds.
+
 Usage:
     python scripts/evaluate.py \
         --grpo-model ./outputs/dc_ops_grpo_final \
         --base-model unsloth/Qwen2.5-7B-Instruct \
         --scenarios A4 B4 \
-        --seeds 100 200 300 400 500 \
+        --n-seeds 20 \
         --temperature 0.0
+    # Episodes run at each scenario's own declared horizon (A4/B4 = 20 steps).
+    # Eval seeds default to a range disjoint from the GRPO training seeds.
 
     # Use --no-base to skip base model (saves time if you just re-ran GRPO):
     python scripts/evaluate.py --grpo-model ./outputs/dc_ops_grpo_final --no-base
@@ -60,6 +69,10 @@ class EpisodeResult:
     per_step_rewards: list[float]
     actions: list[str]
     crashed: bool = False
+    timed_out: bool = False
+    # Physics-outcome scorecard (src/scorecard.py) — metrics the model was
+    # never rewarded for. Independent of total_reward on purpose (issue 1.4).
+    scorecard: dict = field(default_factory=dict)
 
     @property
     def steps_to_resolution(self) -> Optional[int]:
@@ -76,6 +89,97 @@ class AggregateStats:
     std_total_reward: float
     mean_steps_to_resolution: Optional[float]
     mean_per_step_reward: float
+    # Bootstrap 95% CIs (issue 1.6). None when n < 2.
+    reward_ci_low: Optional[float] = None
+    reward_ci_high: Optional[float] = None
+    resolution_rate_ci_low: Optional[float] = None
+    resolution_rate_ci_high: Optional[float] = None
+    # Per-episode-averaged physics scorecard.
+    mean_scorecard: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Statistics (issue 1.6): bootstrap CIs + a paired test on matched seeds.
+# Hand-rolled so the script has no scipy/numpy dependency. Deterministic:
+# the bootstrap RNG is seeded, so reported CIs are reproducible.
+# ---------------------------------------------------------------------------
+import random as _random  # noqa: E402
+
+
+def bootstrap_ci(
+    values: list[float],
+    *,
+    n_boot: int = 5000,
+    alpha: float = 0.05,
+    rng_seed: int = 12345,
+) -> tuple[Optional[float], Optional[float]]:
+    """Percentile bootstrap CI for the mean. Returns (None, None) if n < 2."""
+    vals = [float(v) for v in values]
+    if len(vals) < 2:
+        return (None, None)
+    rng = _random.Random(rng_seed)
+    n = len(vals)
+    means = []
+    for _ in range(n_boot):
+        means.append(sum(vals[rng.randrange(n)] for _ in range(n)) / n)
+    means.sort()
+    lo = means[int((alpha / 2) * n_boot)]
+    hi = means[min(n_boot - 1, int((1 - alpha / 2) * n_boot))]
+    return (lo, hi)
+
+
+def paired_diff_test(
+    results: list["EpisodeResult"],
+    model_a: str,
+    model_b: str,
+    scenario_id: str,
+    *,
+    metric: str = "total_reward",
+    rng_seed: int = 999,
+) -> Optional[dict]:
+    """Paired comparison of ``model_b`` vs ``model_a`` on matched seeds.
+
+    Pairs episodes by seed (only seeds both models ran), computes the per-seed
+    difference ``b - a``, and reports its mean with a bootstrap 95% CI. The
+    difference is 'significant at 95%' when that CI excludes zero. Pairing on
+    seed removes the shared per-episode difficulty variance, which is the whole
+    point of running both models on the *same* seeds.
+    """
+    a = {r.seed: getattr(r, metric) for r in results
+         if r.model_name == model_a and r.scenario_id == scenario_id}
+    b = {r.seed: getattr(r, metric) for r in results
+         if r.model_name == model_b and r.scenario_id == scenario_id}
+    seeds = sorted(set(a) & set(b))
+    diffs = [float(b[s]) - float(a[s]) for s in seeds]
+    if not diffs:
+        return None
+    mean_diff = sum(diffs) / len(diffs)
+    lo, hi = bootstrap_ci(diffs, rng_seed=rng_seed)
+    significant = lo is not None and hi is not None and (lo > 0 or hi < 0)
+    return {
+        "model_a": model_a,
+        "model_b": model_b,
+        "scenario_id": scenario_id,
+        "metric": metric,
+        "n_pairs": len(diffs),
+        "mean_diff": mean_diff,
+        "ci_low": lo,
+        "ci_high": hi,
+        "significant_95": significant,
+    }
+
+
+def _mean_scorecard(scorecards: list[dict]) -> dict:
+    """Average each numeric scorecard field across episodes, skipping None."""
+    if not scorecards:
+        return {}
+    keys = set().union(*(sc.keys() for sc in scorecards))
+    out: dict = {}
+    for k in sorted(keys):
+        vals = [sc[k] for sc in scorecards
+                if isinstance(sc.get(k), (int, float))]
+        out[k] = (sum(vals) / len(vals)) if vals else None
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -147,24 +251,43 @@ def run_episode(
     system_prompt: str,
     scenario_id: str,
     seed: int,
-    step_budget: int = 10,
+    step_budget: Optional[int] = None,
 ) -> EpisodeResult:
-    """Run one full episode and return results."""
+    """Run one full episode and return results.
+
+    `step_budget=None` (the default) lets the environment use the scenario's
+    own declared horizon — A4/B4 declare 20 (issue 1.2). Passing an int
+    overrides it (used by the horizon sweep). The loop length is taken from the
+    environment's `steps_remaining` after reset, so the loop and the dashboard
+    can never disagree the way the old hardcoded `range(10)` did.
+    """
     from dc_ops_env.server.dc_ops_env_environment import DcOpsEnvironment
     from dc_ops_env.models import DcOpsAction
     from src.rewards import extract_command, extract_reasoning
     from src.prompts import user_content_from_obs
-    from src.constants import CRASH_KEYWORDS, RESOLVE_KEYWORDS
+    from src.scorecard import PhysicsScorecard, zone_thresholds_from_env
 
     env = DcOpsEnvironment()
-    obs = env.reset(scenario=scenario_id, seed=seed)
+    reset_kwargs: dict = {"scenario": scenario_id, "seed": seed}
+    if step_budget is not None:
+        reset_kwargs["step_budget"] = step_budget
+    obs = env.reset(**reset_kwargs)
+
+    # The environment is authoritative on the horizon. Right after reset,
+    # steps_remaining == the full budget for this episode.
+    budget = obs.steps_remaining if obs.steps_remaining and obs.steps_remaining > 0 \
+        else (step_budget or 20)
+
+    scorecard = PhysicsScorecard(zone_thresholds=zone_thresholds_from_env(env))
+    scorecard.observe_reset(obs)
 
     per_step_rewards: list[float] = []
     actions: list[str] = []
     resolved = False
     crashed = False
+    timed_out = False
 
-    for step in range(step_budget):
+    for step in range(budget):
         user_content = user_content_from_obs(obs)
         response = runner.generate(system_prompt, user_content)
 
@@ -178,12 +301,19 @@ def run_episode(
         obs = env.step(DcOpsAction(command=cmd, reasoning=reasoning))
         per_step_rewards.append(float(obs.reward))
         actions.append(cmd)
+        scorecard.observe_step(cmd, obs)
 
         if obs.done:
-            alert_l = (obs.alert or "").lower()
-            resolved = any(k in alert_l for k in RESOLVE_KEYWORDS)
-            crashed  = any(k in alert_l for k in CRASH_KEYWORDS)
+            # Outcome comes from the simulator's own signal (issue 1.3), not
+            # from string-matching the alert. A crash ends the episode with
+            # budget still remaining; a timeout ends with steps_remaining == 0.
+            resolved = bool(obs.resolved)
+            timed_out = (not resolved) and obs.steps_remaining <= 0
+            crashed = (not resolved) and not timed_out
             break
+    else:
+        # Loop ran the full budget without the env ever setting done.
+        timed_out = not resolved
 
     return EpisodeResult(
         model_name=runner.model.__class__.__name__,  # overwritten by caller
@@ -191,11 +321,13 @@ def run_episode(
         seed=seed,
         resolved=resolved,
         crashed=crashed,
+        timed_out=timed_out,
         steps_taken=len(per_step_rewards),
-        step_budget=step_budget,
+        step_budget=budget,
         total_reward=sum(per_step_rewards),
         per_step_rewards=per_step_rewards,
         actions=actions,
+        scorecard=scorecard.summary(),
     )
 
 
@@ -206,12 +338,18 @@ def aggregate(results: list[EpisodeResult], model_name: str, scenario_id: str) -
 
     n = len(subset)
     total_rewards = [r.total_reward for r in subset]
+    resolved_flags = [1.0 if r.resolved else 0.0 for r in subset]
     resolved_results = [r for r in subset if r.resolved]
     resolution_rate = len(resolved_results) / n
     mean_steps_res = (
         mean(r.steps_taken for r in resolved_results) if resolved_results else None
     )
     all_step_rewards = [r for ep in subset for r in ep.per_step_rewards]
+
+    reward_lo, reward_hi = bootstrap_ci(total_rewards, rng_seed=hash(
+        (model_name, scenario_id, "reward")) & 0xFFFFFFFF)
+    res_lo, res_hi = bootstrap_ci(resolved_flags, rng_seed=hash(
+        (model_name, scenario_id, "resolved")) & 0xFFFFFFFF)
 
     return AggregateStats(
         model_name=model_name,
@@ -222,6 +360,11 @@ def aggregate(results: list[EpisodeResult], model_name: str, scenario_id: str) -
         std_total_reward=stdev(total_rewards) if n > 1 else 0.0,
         mean_steps_to_resolution=mean_steps_res,
         mean_per_step_reward=mean(all_step_rewards) if all_step_rewards else 0.0,
+        reward_ci_low=reward_lo,
+        reward_ci_high=reward_hi,
+        resolution_rate_ci_low=res_lo,
+        resolution_rate_ci_high=res_hi,
+        mean_scorecard=_mean_scorecard([r.scorecard for r in subset]),
     )
 
 
@@ -257,11 +400,23 @@ def parse_args():
                    help="Skip base-model evaluation.")
     p.add_argument("--scenarios", nargs="+", default=["A4", "B4"],
                    help="Scenario IDs to evaluate on (default: A4 B4).")
-    p.add_argument("--seeds", nargs="+", type=int,
-                   default=[100, 200, 300, 400, 500],
-                   help="Random seeds (one episode per seed per scenario).")
-    p.add_argument("--step-budget", type=int, default=10,
-                   help="Max steps per episode.")
+    p.add_argument("--seeds", nargs="+", type=int, default=None,
+                   help="Explicit seeds (one episode per seed per scenario). "
+                        "Overrides --n-seeds.")
+    p.add_argument("--n-seeds", type=int, default=20,
+                   help="Number of seeds per scenario when --seeds is not given "
+                        "(default 20; issue 1.6 needs n>=20 for usable CIs).")
+    p.add_argument("--seed-base", type=int, default=1_000_000,
+                   help="First seed; seeds are seed-base + i*step. Default is far "
+                        "from the GRPO training seed ranges (1000-1203, 5000-5702 "
+                        "in src/grpo_data.py) so evaluation is a genuine held-out "
+                        "test set, not the training states (Part 5 #3).")
+    p.add_argument("--seed-step", type=int, default=1000,
+                   help="Spacing between generated seeds.")
+    p.add_argument("--step-budget", type=int, default=None,
+                   help="Max steps per episode. Default: use each scenario's own "
+                        "declared budget (A4/B4 = 20; issue 1.2). Set an int to "
+                        "override, e.g. for a horizon sweep.")
     p.add_argument("--temperature", type=float, default=0.0,
                    help="Generation temperature (0=greedy).")
     p.add_argument("--max-seq-length", type=int, default=3072)
@@ -272,20 +427,77 @@ def parse_args():
     return p.parse_args()
 
 
+def _ci_str(lo: Optional[float], hi: Optional[float], fmt: str = ".3f") -> str:
+    if lo is None or hi is None:
+        return "     —      "
+    return f"[{lo:{fmt}}, {hi:{fmt}}]"
+
+
 def print_table(stats_list: list[AggregateStats]):
-    print("\n" + "=" * 80)
-    print(f"{'Model':<30} {'Scenario':<10} {'N':>4}  {'ResRate':>8}  "
-          f"{'MeanRew':>9}  {'StdRew':>8}  {'MeanStep':>9}  {'PerStep':>8}")
-    print("-" * 80)
+    """Reward / resolution table WITH bootstrap 95% CIs (issue 1.6).
+
+    NOTE: mean reward here is the *training* signal. It answers "did the number
+    we optimised move?" — not "did the model get better". Read it alongside the
+    physics scorecard below, which the model was never rewarded for (issue 1.4).
+    """
+    print("\n" + "=" * 92)
+    print("REWARD / RESOLUTION  (reward == the trained objective; interpret with care)")
+    print("-" * 92)
+    print(f"{'Model':<14} {'Scen':<6} {'N':>3}  {'ResRate':>8} "
+          f"{'Res 95% CI':>16}  {'MeanRew':>8} {'Reward 95% CI':>18}  {'Steps':>6}")
+    print("-" * 92)
     for s in stats_list:
-        steps_str = f"{s.mean_steps_to_resolution:.1f}" if s.mean_steps_to_resolution else "  —"
-        print(f"{s.model_name:<30} {s.scenario_id:<10} {s.n_episodes:>4}  "
-              f"{s.resolution_rate:>8.1%}  "
-              f"{s.mean_total_reward:>9.3f}  "
-              f"{s.std_total_reward:>8.3f}  "
-              f"{steps_str:>9}  "
-              f"{s.mean_per_step_reward:>8.3f}")
-    print("=" * 80)
+        steps_str = f"{s.mean_steps_to_resolution:.1f}" if s.mean_steps_to_resolution else "—"
+        res_ci = _ci_str(s.resolution_rate_ci_low, s.resolution_rate_ci_high, ".2f")
+        rew_ci = _ci_str(s.reward_ci_low, s.reward_ci_high)
+        print(f"{s.model_name:<14} {s.scenario_id:<6} {s.n_episodes:>3}  "
+              f"{s.resolution_rate:>8.1%} {res_ci:>16}  "
+              f"{s.mean_total_reward:>8.3f} {rew_ci:>18}  {steps_str:>6}")
+    print("=" * 92)
+
+
+def print_physics_table(stats_list: list[AggregateStats]):
+    """Physics-outcome scorecard (issue 1.4) — metrics NOT in the reward."""
+    cols = [
+        ("peak_inlet_c", "PeakInlet", ".1f"),
+        ("degree_min_over_allowable", "DegMin>Allow", ".1f"),
+        ("min_ups_soc", "MinUPS_SoC", ".2f"),
+        ("generator_online_latency_s", "GenLat_s", ".0f"),
+        ("mean_pue", "PUE", ".3f"),
+        ("total_energy_kwh", "kWh", ".1f"),
+        ("invalid_command_rate", "InvCmd", ".2f"),
+        ("malformed_target_rate", "BadTgt", ".2f"),
+    ]
+    print("\n" + "=" * 100)
+    print("PHYSICS-OUTCOME SCORECARD  (independent of reward — the real evidence)")
+    print("-" * 100)
+    header = f"{'Model':<14} {'Scen':<6}" + "".join(f"{c[1]:>13}" for c in cols)
+    print(header)
+    print("-" * 100)
+    for s in stats_list:
+        row = f"{s.model_name:<14} {s.scenario_id:<6}"
+        for key, _, fmt in cols:
+            v = s.mean_scorecard.get(key)
+            row += f"{('—' if v is None else format(v, fmt)):>13}"
+        print(row)
+    print("=" * 100)
+
+
+def print_paired_tests(tests: list[dict]):
+    if not tests:
+        return
+    print("\n" + "=" * 92)
+    print("PAIRED TEST  (grpo − base on matched seeds; bootstrap 95% CI of mean diff)")
+    print("-" * 92)
+    print(f"{'Scenario':<10} {'Metric':<16} {'Pairs':>6} {'MeanDiff':>10} "
+          f"{'95% CI':>22} {'Sig@95%':>8}")
+    print("-" * 92)
+    for t in tests:
+        ci = _ci_str(t["ci_low"], t["ci_high"])
+        sig = "yes" if t["significant_95"] else "no"
+        print(f"{t['scenario_id']:<10} {t['metric']:<16} {t['n_pairs']:>6} "
+              f"{t['mean_diff']:>10.3f} {ci:>22} {sig:>8}")
+    print("=" * 92)
 
 
 def main():
@@ -301,6 +513,17 @@ def main():
     if not args.no_base:
         models_to_eval.append(("base", args.base_model))
     models_to_eval.append(("grpo", args.grpo_model))
+
+    # Resolve seeds. Both models run the SAME seeds so the paired test can
+    # match episodes seed-for-seed (issue 1.6). With the environment now
+    # seeding initial conditions (env issue 1.1), distinct seeds are distinct
+    # episodes rather than identical copies.
+    if args.seeds:
+        seeds = list(args.seeds)
+    else:
+        seeds = [args.seed_base + i * args.seed_step for i in range(args.n_seeds)]
+    print(f"[eval] {len(seeds)} seeds/scenario: {seeds[0]}..{seeds[-1]}  "
+          f"step_budget={'scenario-default' if args.step_budget is None else args.step_budget}")
 
     all_results: list[EpisodeResult] = []
 
@@ -318,7 +541,7 @@ def main():
 
         for scenario_id in args.scenarios:
             print(f"\n[eval] Scenario {scenario_id}:")
-            for seed in args.seeds:
+            for seed in seeds:
                 print(f"  seed={seed} ...", end=" ", flush=True)
                 result = run_episode(
                     runner=runner,
@@ -331,7 +554,7 @@ def main():
                 all_results.append(result)
 
                 status = "✓ RESOLVED" if result.resolved else ("✗ CRASHED" if result.crashed else "— timeout")
-                print(f"{status}  steps={result.steps_taken}  "
+                print(f"{status}  steps={result.steps_taken}/{result.step_budget}  "
                       f"total_reward={result.total_reward:.3f}  "
                       f"actions={result.actions}")
 
@@ -344,13 +567,27 @@ def main():
             stats = aggregate(all_results, model_name, scenario_id)
             all_stats.append(stats)
 
+    # Paired tests: grpo vs base on matched seeds (only if base was run).
+    paired_tests: list[dict] = []
+    model_names = [m for (m, _) in models_to_eval]
+    if "base" in model_names and "grpo" in model_names:
+        for scenario_id in args.scenarios:
+            for metric in ("total_reward", "resolved"):
+                t = paired_diff_test(all_results, "base", "grpo", scenario_id, metric=metric)
+                if t:
+                    paired_tests.append(t)
+
     print_table(all_stats)
+    print_physics_table(all_stats)
+    print_paired_tests(paired_tests)
 
     # Save results
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     output = {
         "config": vars(args),
+        "seeds": seeds,
         "aggregate": [asdict(s) for s in all_stats],
+        "paired_tests": paired_tests,
         "episodes": [asdict(r) for r in all_results],
     }
     with open(args.output, "w") as f:
